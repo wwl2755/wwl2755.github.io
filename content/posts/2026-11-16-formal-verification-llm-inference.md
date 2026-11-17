@@ -263,7 +263,7 @@ These are not hypothetical. From vstack's verified bug list ([SGLang](https://gi
 
 It is a poor fit for some things. Performance (latency, throughput) is out of scope. Floating point is hard: addition is not associative, so "bit-identical to the reference kernel" is often false by design, and proving error bounds is expensive. Anything without a precise definition, such as output quality, cannot be specified. And Python plus CUDA cannot be verified directly today, so the realistic setup is a design-level model plus runtime checks and trace replay to keep it honest.
 
-My rule of thumb: if you can state in one precise sentence what must never happen or what must eventually happen, and tests cannot cover every ordering, it is worth a model.
+**My rule of thumb: if you can state in one precise sentence what must never happen or what must eventually happen, and tests cannot cover every ordering, it is worth a model.**
 
 ## My takeaways: what we still need
 
