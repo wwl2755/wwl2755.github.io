@@ -17,7 +17,7 @@ from pygments.formatters import HtmlFormatter
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "docs"
-SITE = {"title": "Wenlong", "author": "Wenlong", "url": "https://wwl2755.github.io",
+SITE = {"title": "Wenlong Wang", "author": "Wenlong Wang", "url": "https://wwl2755.github.io",
         "tagline": "I work on LLM inference systems."}
 
 
@@ -80,7 +80,7 @@ def build():
         f'<p>{escape(m.get("description", ""))}</p></li>' for d, m, url in posts)
     blog = f'<section class="intro"><h1>Blog</h1></section><ul class="posts">{items}</ul>'
     (OUT / "blog").mkdir()
-    (OUT / "blog" / "index.html").write_text(page(f'Blog · {SITE["title"]}', blog, "Posts by Wenlong.", SITE["url"] + "/blog/"))
+    (OUT / "blog" / "index.html").write_text(page(f'Blog · {SITE["title"]}', blog, "Posts by Wenlong Wang.", SITE["url"] + "/blog/"))
     home = (f'<section class="home"><h1>{escape(SITE["title"])}</h1>'
             f'<p>{escape(SITE["tagline"])}</p>'
             f'<p class="links"><a href="/blog/">Blog →</a></p></section>')

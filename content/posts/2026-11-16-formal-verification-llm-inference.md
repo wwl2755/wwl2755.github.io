@@ -1,18 +1,16 @@
 ---
 title: What I Learned About Formal Verification for LLM Inference
 date: 2026-11-16
-description: Learning notes on formal verification for inference engineers, from a silent PD-disaggregation bug to an 80-line TLA+ model of a real vLLM bug.
+description: Learning notes on formal verification for LLM inference, from a silent PD-disaggregation bug to an 80-line TLA+ model of a real vLLM bug.
 ---
 
-The scariest bug in LLM serving is not a crash. It is an HTTP 200 whose answer contains someone else's KV cache.
+Recent LMSYS and Cloudflare disclosures, cited in Hao AI Lab's [Towards Verifiable LLM Infra](https://haoailab.com/blogs/verifiable-llm-infra/), describe silent failures in prefill-decode (PD) disaggregated serving, including a rejected-request KV handoff bug that exposed data across 155 user responses.
 
-This post is my learning notes from Hao AI Lab's [Towards Verifiable LLM Infra](https://haoailab.com/blogs/verifiable-llm-infra/) and its two repos, [vstack](https://github.com/hao-ai-lab/vstack) and [veriserve](https://github.com/hao-ai-lab/veriserve). It is written for inference engineers with zero formal-methods background. Where something is my own result or opinion rather than theirs, I say so.
+This post is my learning notes from that blog and its two repos, [vstack](https://github.com/hao-ai-lab/vstack) and [veriserve](https://github.com/hao-ai-lab/veriserve).
 
-## The bug that made me care
+## How a late KV write leaks data
 
-In prefill-decode (PD) disaggregation, a Decode instance can time out waiting for a request's KV cache, free that request's KV pages, and hand them to a new request. Meanwhile the Prefill instance's RDMA write for the old request is still queued on the NIC, and it lands in the new request's pages. Nothing crashes and no error is logged. The new user just gets an answer polluted by another user's context.
-
-This is not hypothetical. The blog cites recent LMSYS and Cloudflare disclosures of PD failures in production, including a rejected-request KV handoff bug that exposed data across 155 user responses.
+One failure of this kind, which veriserve studies in depth: a Decode instance times out waiting for a request's KV cache, frees that request's KV pages, and hands them to a new request. Meanwhile the Prefill instance's RDMA write for the old request is still queued on the NIC, and it lands in the new request's pages. Nothing crashes and no error is logged. The new user just gets an answer polluted by another user's context.
 
 ### How the KV gets there
 
@@ -51,18 +49,15 @@ The root cause is one wrong inference: Decode treated "I have waited too long" a
 
 With n concurrent actors each taking k steps, the number of possible orderings (interleavings) is (nk)!/(k!)^n:
 
-| Actors × steps | Possible orderings |
-| --- | --- |
-| 2 × 5 | 252 |
-| 3 × 5 | 756,756 |
-| 4 × 5 | 11,732,745,024 |
-| 3 × 10 | 5,550,996,791,340 |
+{{fig:interleavings|Each extra actor or step multiplies the orderings. Counts are (nk)!/(k!)^n, computed exactly.}}
 
 A PD deployment has at least the scheduler, the Prefill worker, the Decode worker, the RDMA NIC, GPU streams, and users who can abort at any moment. A stress test walks one of these orderings, usually the most common one. Reproducing the bug on real hardware also needs multiple GPUs, RDMA NICs and precise cross-node timing.
 
 ## Formal verification in one page
 
 Formal verification means treating the program as a mathematical object, writing "correct" as a precise proposition, and proving it. The whole field fits in one line: **M ⊨ P**, "model M satisfies property P". Testing checks examples; verification checks a universal claim: for all inputs and **all schedules**, the program satisfies P.
+
+{{fig:m-p-check|The three parts of every formal check: a model, a property, and a checker that either confirms it or hands back a counterexample.}}
 
 ### The model is a state machine
 
@@ -100,11 +95,15 @@ At every step, any action whose precondition holds may be the next one. You do n
 
 Liveness usually needs fairness assumptions ("if the RDMA completion keeps being possible, it eventually happens"), and those assumptions are promises about your hardware.
 
+{{fig:safety-liveness|A safety bug shows up as a finite trace; a liveness bug as a loop that never reaches the good state.}}
+
 ### Proofs rest on inductive invariants
 
 To prove Inv holds in every reachable state you need two facts: **Init ⇒ Inv**, and **Inv ∧ Next ⇒ Inv′** (any step from a state satisfying Inv keeps it). It is the same idea as a loop invariant.
 
 The catch: the property you care about is rarely inductive on its own. "A node with lock_ref > 0 is never evicted" fails the induction step, because it allows states where lock_ref no longer matches the real number of users. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.
+
+{{fig:induction|P alone admits unreachable states like u from which one step breaks P. The strengthened Inv excludes them, so every step from Inv stays in Inv.}}
 
 ### Three families of tools, used together
 
@@ -118,6 +117,8 @@ The catch: the property you care about is rarely inductive on its own. "A node w
 | Best for | Protocols, concurrency, lifecycles | Arithmetic, indexing, addresses | Final, unbounded guarantees |
 
 Model checking does breadth-first search, so the first violation it finds is the **shortest** reproduction. It suffers from state explosion, so you run it at tiny scale (say 3 requests and 2 pages). That works because of the small-scope hypothesis: most concurrency bugs show up at small scale. In my own toy model of the RDMA bug above, 2 requests and 1 page are enough to hit it.
+
+{{fig:bfs|TLC explores level by level, so the first violation it reports is the shortest possible reproduction.}}
 
 SMT turns a bug into a question. Can two different (page, slot) pairs map to the same KV address? ([kv_address.py](/assets/models/kv_address.py))
 
@@ -138,6 +139,8 @@ Change `t < PAGE` to `t <= PAGE` (a classic off-by-one) and Z3 answers `sat` wit
 ### Reading "verified" correctly
 
 Every result really means: **under assumptions A, model M satisfies property P.** A can be wrong (the NIC does drop completion notices). M can be wrong (a code path left out, or a non-atomic step modeled as atomic). P can be wrong (you proved something other than what you care about). "Verified" does not mean bug-free. It means any remaining bug lives outside an explicit list of assumptions and abstractions.
+
+{{fig:verified-means|A proof moves the bugs that can remain into three named places, plus the tools you trust.}}
 
 ## The PD bug is a dilemma, not a bad timeout value
 
@@ -349,18 +352,6 @@ Formal verification can largely handle the bugs testing is worst at: interleavin
 1. **Specs are the product, and humans must own them.** The tool proves whatever you write down. Deciding what "correct" means was the hardest and least automatable step in my example. Inference engines would benefit from a shared, reviewed spec library organized by the classes above, reused across vLLM and SGLang.
 2. **The model-code gap needs CI, not a one-off proof.** We cannot verify Python or CUDA directly, so the model is a second artifact that drifts. Trace replay (production logs must be valid behaviors of the model) and runtime checks derived from the model's preconditions should run on every PR, like tests.
 3. **Hardware assumptions are the new trust boundary.** Half of the PD story is RDMA semantics: what a one-sided write guarantees, whether it can be cancelled, what a completion actually certifies. Proofs are only as good as that assumption list, and much of it is tribal knowledge today, not a spec anyone stands behind.
-
-## How to start
-
-You do not need to go all the way at once:
-
-1. Turn the `assert`s you already have into precise invariants (used + free pages = total; lock_ref = real users).
-2. Hammer them with property-based tests: generate random sequences of alloc, free, abort and evict with Hypothesis.
-3. Put the same invariant into TLA+ and let TLC try every interleaving at small scale.
-4. Validate the model: the old bug fails, mutations fail, a reachability witness is violated, real traces replay.
-5. Where you need a full guarantee, find the strengthened invariant and prove it with TLAPS or Dafny.
-
-Good first resources are Leslie Lamport's free TLA+ video course, [learntla.com](https://learntla.com), and the [Z3 guide](https://microsoft.github.io/z3guide).
 
 ## Sources
 
