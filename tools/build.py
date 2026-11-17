@@ -60,7 +60,7 @@ def build():
     for src in sorted((ROOT / "content" / "posts").glob("*.md"), reverse=True):
         meta, body = front_matter(src.read_text())
         slug = src.stem[11:]
-        md = markdown.Markdown(extensions=["fenced_code", "codehilite", "tables", "toc", "attr_list"],
+        md = markdown.Markdown(extensions=["fenced_code", "codehilite", "tables", "toc", "attr_list", "sane_lists"],
                                extension_configs={"codehilite": {"guess_lang": False, "css_class": "highlight"},
                                                   "toc": {"permalink": "#", "permalink_title": "Link to this section"}})
         html = md.convert(figures(body))

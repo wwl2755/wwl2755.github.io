@@ -14,16 +14,11 @@ A closely related PD failure, which veriserve studies in depth, needs no misconf
 
 ### How the KV gets there
 
-Taking SGLang with a push-style transfer backend (Mooncake) as the example, one KV transfer has four steps:
+In PD disaggregation, Decode reserves KV pages for the request and tells Prefill which pages to fill. Prefill computes the KV, and its NIC writes it straight into Decode's GPU memory with one-sided RDMA. When the write is done, Prefill sends a done notice, and only then does Decode use the pages.
 
 {{fig:pd-transfer|One KV transfer. Decode chooses the pages; Prefill's NIC writes into them directly.}}
 
-1. The router assigns the request a bootstrap room (a transfer session id) and sends it to both Prefill and Decode.
-2. Decode **pre-allocates** KV pages in its own pool and tells Prefill which pages to write (the destination KV indices).
-3. Prefill computes the KV and posts an **RDMA WRITE**: the NIC writes straight into Decode's GPU memory (GPUDirect RDMA).
-4. Once the write is done, Prefill sends a done notice. Only then does Decode hand the pages to attention.
-
-Three properties of one-sided RDMA make this fragile:
+Three properties make this fragile:
 
 - **One-sided:** Decode's CPU is not involved and cannot see when the write happens.
 - **Not cancellable:** in [Hao AI Lab's](https://haoailab.com/blogs/verifiable-llm-infra/) words, one-sided transfers already queued on the NIC "cannot be canceled in hardware on the studied transport paths".
@@ -157,28 +152,21 @@ With safety and liveness in hand, the PD bug looks different. Decode has two opt
 
 {{fig:pd-fix|PdLedger page states when a request ends or times out. Simplified: the ledger tracks six states in all, adding SHARED and DUP for prefix sharing.}}
 
-On a timeout the request fails and returns at once, so it never hangs. Its pages go to DRAINING, not FREE, and Decode sends an ABORT asking Prefill whether the write has stopped.
-
-- **Prefill acknowledges only what it can prove:** the write was never handed to the NIC (it is cancelled, and a tombstone makes any later post of it fail), or the write has completed. With that ACK, the pages go back to FREE.
-- **No proof means quarantine:** if the ACK times out, Prefill reports a failed write it cannot vouch for, or the peer is lost, the pages go to QUARANTINED and are never reused for the life of the process. A late write can then only land in a page nobody uses.
-- **Generations reject stale messages:** every page carries a (page, gen) ticket and transfer ids are never reused. A done notice or ACK that does not match the peer, room, generation and transfer id is dropped. This closes a second bug family, where a message from an old session is taken for the current one.
-- **Prefill reports done only when it is true:** the done notice goes out after every block has completed locally, not when the write is posted, because a notice sent at submission can overtake the data.
+On a timeout the request fails at once, so it never hangs, but its pages go to DRAINING instead of FREE. A page returns to FREE only with evidence that the write has stopped: Prefill confirms the write either never reached the NIC or has completed. Without that evidence the page is QUARANTINED and never reused, so a late write can only land in a page nobody uses. Version numbers on pages and transfers make a stale message from an earlier session harmless.
 
 The cost is a few pages lost for good when something goes wrong. Across six paired runs against an unverified bypass baseline, [the blog](https://haoailab.com/blogs/verifiable-llm-infra/) measures PdLedger at +0.18% mean p50 TPOT (95% CI −0.32% to +0.68%). Note what is proven: the TLAPS proof covers safety only. Finality, the request failing fast instead of hanging, is runtime behavior outside the proof.
 
-Upstream, [veriserve's case studies](https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies) split the SGLang issues in two. Room-reuse identity confusion has five local fix PRs ([#48883](https://github.com/sgl-project/sglang/pull/48883), [#48889](https://github.com/sgl-project/sglang/pull/48889), [#48960](https://github.com/sgl-project/sglang/pull/48960), [#48979](https://github.com/sgl-project/sglang/pull/48979), [#48982](https://github.com/sgl-project/sglang/pull/48982)), all open and unmerged when the case studies were checked on 2026-11-08 (they apply the generation idea above). Treating a timeout or an error as "the remote side has stopped" is filed as architectural, with no local PR, because no local patch escapes the dilemma; it needs a page state machine like this one.
+In upstream SGLang, the stale-message bugs have local fix PRs ([#48883](https://github.com/sgl-project/sglang/pull/48883), [#48889](https://github.com/sgl-project/sglang/pull/48889), [#48960](https://github.com/sgl-project/sglang/pull/48960), [#48979](https://github.com/sgl-project/sglang/pull/48979), [#48982](https://github.com/sgl-project/sglang/pull/48982)), but treating a timeout as "the remote side has stopped" is classed as architectural: no local patch escapes the dilemma ([veriserve case studies](https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies)).
 
-## A worked example: an 80-line model of a real vLLM bug
+## A worked example: modeling a real vLLM bug
 
-To learn the workflow end to end, I modeled one bug from vstack's [verified bug list](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0): after a LoRA hot reload, new requests can silently run on old weights ([vLLM PR #67459](https://github.com/vllm-project/vllm/pull/67459)). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. Every TLC result quoted here is a real run. Files: [LoraReload.tla](/assets/models/LoraReload.tla), [bug.cfg](/assets/models/bug.cfg), [fix.cfg](/assets/models/fix.cfg), [reach.cfg](/assets/models/reach.cfg).
+To learn the workflow end to end, I modeled one bug from vstack's [verified bug list](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0): after a LoRA hot reload, new requests can silently run on old weights ([vLLM PR #67459](https://github.com/vllm-project/vllm/pull/67459)). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. It is about 80 lines of TLA+ ([LoraReload.tla](/assets/models/LoraReload.tla)), and every result below is from a real TLC run.
 
-### The setup
+### The bug
 
 {{fig:lora-ledgers|The front end, the queued request and the worker can each hold a different idea of which weights adapter A means.}}
 
-vLLM keeps LoRA state in two ledgers. The front end maps each adapter name to a `LoRARequest` (an int id plus a weight path), and every incoming request carries the `LoRARequest` that was current when it was admitted. Each worker keeps a CPU LRU cache from id to loaded weights. `add_adapter` loads from the request's own path on a cache miss, and reuses the cached weights on a hit without looking at the path. A hot reload (`/load_lora_adapter` with `load_inplace=True`) reloads the worker and points the front end at the new path.
-
-The bug, in five events:
+vLLM keeps two records of which weights a LoRA adapter means: the front end's (name → weight path) and each worker's CPU cache of loaded weights. Every queued request carries the path that was current when it arrived. On a cache miss the worker loads from the request's path; on a hit it reuses the cached weights without checking. A hot reload switches both records to the new path, in five events:
 
 1. Adapter A is at v1. Request r1 arrives carrying "A → v1" and waits in the queue.
 2. A is hot-reloaded to v2. The worker cache and the front end both now say v2.
@@ -186,129 +174,29 @@ The bug, in five events:
 4. r1 is scheduled. A is not cached, so it is loaded from r1's stale path: **the cache goes back to v1**.
 5. New request r2 carries "A → v2", finds A in the cache, and **runs on v1 weights with no error**.
 
-The victim (r2) is not the culprit (r1), which is why per-request assertions miss it. The bug also needs more adapters than `max_cpu_loras`; single-adapter setups are unaffected.
+The victim (r2) is not the culprit (r1), which is why per-request assertions miss it. The bug also needs more adapters than the CPU cache holds; single-adapter setups are unaffected.
 
-### Reading the TLA+ below
+### Modeling it, step by step
 
-TLA+ describes the same kind of state machine as the Python sketch earlier. `Reqs` is the set of requests in the model (r1, r2, …). The model's state is seven variables:
+1. **Write the spec. It is a design decision.** The obvious spec, "every request runs the version it arrived with", is wrong: the upstream fix runs r1 on v2 too, which is what a hot reload should mean. The rule I chose: once a request is done, the version it ran on is at least the version it arrived with. Old requests may get newer weights; new requests must never get older ones.
+2. **Abstract.** Paths become version numbers. The cache holds one adapter and there are only two, A and B, which is enough to evict A. Tensors, GPUs and tensor parallelism are dropped. The hot reload is modeled as one atomic step, an assumption to revisit later. What remains is 7 variables and 4 actions: a request arrives, a hot reload, another adapter evicts A, a request runs.
+3. **Model both versions of the code.** One switch selects the code before or after the patch. The fix: the worker remembers the latest hot-reload source and loads from it on a cache miss.
+4. **Check it.** With 2 requests and 2 versions, TLC finds the violation in under a second. Its counterexample is exactly the five events above, as 7 states (the start plus 6 steps, because r2 arriving is its own step), and it is the shortest one possible.
 
-| Variable | Meaning |
-| --- | --- |
-| `reg` | the version of adapter A the front end currently points to (1, 2, …) |
-| `cacheA` | the version of A in the worker's CPU cache, 0 if not cached |
-| `cacheB` | whether adapter B is in the cache (capacity is 1, so A and B evict each other) |
-| `inplaceSrc` | the latest hot-reload version the worker remembers (used only by the fixed code), 0 if none |
-| `status[r]` | request r's state: `"idle"`, `"queued"` or `"done"` |
-| `snap[r]` | the version request r carried when it was admitted |
-| `used[r]` | the version request r actually ran on |
+{{fig:lora-trace|TLC's counterexample, plotted (numbers are states, not the five events above). At state 5 the cache holds v1 while the front end says v2; at state 7 r2 runs on v1 and the rule fails.}}
 
-The syntax you need:
-
-| TLA+ | Meaning |
-| --- | --- |
-| `X == …` | define X |
-| `/\`  `\/` | and, or (a list of `/\` lines must all hold) |
-| `\A r \in S : …` | for every r in S |
-| `=>`  `#` | implies, not equal |
-| `x'` | the value of x after this step |
-| `[f EXCEPT ![r] = v]` | f with only entry r changed to v |
-| `UNCHANGED <<x, y>>` | x and y keep their values this step |
-| `LET … IN …` | local definitions |
-| `\*` | comment |
-
-An action such as `Run(r)` is a list of conditions on the state before (unprimed) and after (primed) one step. The step can happen only when all of them can be true.
-
-### Step 1: the spec is a design decision
-
-The obvious spec, "every request runs the version it was admitted with", is wrong: the upstream fix runs r1 on v2 too, which is what a hot reload should mean. The policy I chose is that old requests may run on newer weights, but new requests must never run on older ones:
-
-```tla
-NoStaleWeights == \A r \in Reqs : status[r] = "done" => used[r] >= snap[r]
-```
-
-In words: for every request, once it is done, the version it ran on is at least the version it was admitted with.
-
-### Step 2: abstract
-
-Paths become version numbers. The cache gets capacity 1 with only adapters A and B, which is enough to evict A. All of B's traffic collapses into one action, `UseB`. Tensors, GPU slots and tensor parallelism are dropped. One simplification is recorded as an assumption: the hot reload is modeled as a single atomic step. The model has 7 variables and 4 actions (`Admit`, `Reload`, `UseB`, `Run`), each mapped back to a code location.
-
-### Step 3: model
-
-The upstream fix makes the worker remember the latest hot-reload source for each adapter id and load from it on a cache miss. A constant `FIX` lets one model describe the code before (`FALSE`) and after (`TRUE`) the patch. `Reload` is where the fix records the source:
-
-```tla
-Reload ==
-  /\ reg < MaxVer                      \* MaxVer bounds the number of versions
-  /\ reg' = reg + 1
-  /\ cacheA' = reg + 1                 \* the worker reloads A right away
-  /\ cacheB' = FALSE                   \* capacity 1: loading A evicts B
-  /\ inplaceSrc' = IF FIX THEN reg + 1 ELSE inplaceSrc
-  /\ UNCHANGED <<status, snap, used>>
-```
-
-The key action, `Run`, is a direct translation of `add_adapter`:
-
-```tla
-Run(r) ==
-  /\ status[r] = "queued"
-  /\ LET loadVer == IF FIX /\ inplaceSrc # 0
-                     THEN inplaceSrc   \* fixed: newest hot-reload source
-                     ELSE snap[r]      \* original: the request's stale path
-         ver == IF cacheA = 0 THEN loadVer   \* miss: load
-                              ELSE cacheA    \* hit: reuse
-     IN /\ cacheA' = ver
-        /\ cacheB' = IF cacheA = 0 THEN FALSE ELSE cacheB  \* a load evicts B
-        /\ used' = [used EXCEPT ![r] = ver]
-  /\ status' = [status EXCEPT ![r] = "done"]
-  /\ UNCHANGED <<reg, inplaceSrc, snap>>
-```
-
-### Step 4: run TLC
-
-```bash
-java -cp tla2tools.jar tlc2.TLC -deadlock -config bug.cfg LoraReload
-```
-
-`bug.cfg` sets 2 requests, 2 versions and `FIX = FALSE`. TLC finds the violation in under a second and prints the five events above as a trace of 7 states (the start state plus 6 steps; admitting r2 is its own step), the shortest one possible:
-
-{{fig:lora-trace|TLC's 7-state counterexample, plotted (numbers are states, not the five events above). At state 5 the cache holds v1 while the front end says v2; at state 7 r2 runs on v1 and NoStaleWeights fails.}}
-
-With `FIX = TRUE` the violation disappears. "Distinct states" is the number of different states TLC reached and checked:
-
-| Config | Distinct states | Result |
+| Configuration | Distinct states checked | Result |
 | --- | --- | --- |
-| Original code, 2 requests, 2 versions | 89 | NoStaleWeights violated, 7-state trace |
+| Original code, 2 requests, 2 versions | 89 | Rule violated, 7-state trace |
 | Fixed code, 2 requests, 2 versions | 90 | Passes |
 | Fixed code, 3 requests, 3 versions | 2,486 | Passes |
 
-A beginner trap: the first run of the fixed model reported "Deadlock reached". Once every request is done the model has nothing left to do, which TLC treats as deadlock by default. Here that is normal termination, so pass `-deadlock`, which tells TLC not to report it.
-
-### Step 5: check that the model is not lying
-
-A property passes either because it is true, or because the bad state is unreachable in your model. Three checks separate the two:
-
-- **The historical bug must fail** on the original model. It does.
-- **Mutation:** in the fixed model, change `Reload`'s `inplaceSrc'` line to `inplaceSrc' = inplaceSrc`, so the new source is never recorded. The fixed model fails again, so that line is load-bearing.
-- **Reachability witness:** assert something that *should* be violated ("no request admitted after a reload ever finishes"). TLC breaks it at the 4th state, so the interesting path is reachable.
-
-### Step 6: from bounded to any scale
-
-The fact that carries the proof is a strengthened invariant:
-
-```tla
-FreshCache ==
-  /\ cacheA \in {0, reg}              \* cacheA is 0 or reg: absent or newest
-  /\ (reg > 1 => inplaceSrc = reg)    \* a reload always records its source
-  /\ \A r \in Reqs : snap[r] <= reg   \* no request holds a future version
-```
-
-This is the strengthening from the induction section. The first line is the real point and states the bug in one sentence: the worker cache must never be older than the front end. The other two lines are what make it inductive: line 2 says the source a cache miss would load from is always the newest, and line 3 rules out impossible states where a request holds a version from the future. On the original model TLC reports the second line failing right after the first reload, because the old code never records a source; the first line would fail later too, at state 5 of the trace above.
-
-TLC confirms FreshCache holds in every reachable state of the fixed model with 3 requests and 3 versions. That alone is not a proof that it is inductive. Proving that with TLAPS would extend the result to any number of requests and versions.
+5. **Make sure the model is not lying.** A rule can pass because it is true, or because the model cannot even reach the bad state. Three checks tell them apart. The original code must fail; it does. A mutation, stopping the fixed code from recording the new source, must fail again; it does, so that part of the fix is load-bearing. A reachability witness, a claim that *should* fail ("no request that arrives after a reload ever finishes"), must fail; TLC breaks it in 4 states, so the interesting path is reachable.
+6. **Strengthen it for any scale.** The fact that actually carries the proof: the worker's cached copy of A is either absent or the newest version. Two helper facts make it inductive: a reload always records its source, and no request holds a version from the future. This is the strengthening from the induction section, and its main line states the bug in one sentence: the worker cache must never be older than the front end. TLC confirms it in every reachable state with 3 requests and 3 versions, and on the original code it fails right after the first reload. A TLAPS proof would extend the result to any number of requests and versions; checking reachable states alone does not.
 
 ### What this does not prove
 
-The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. [vstack's entry for this bug](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0) also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting `Reload` into two actions is a good exercise.
+The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. [vstack's entry for this bug](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0) also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting the hot reload into two steps is a good exercise.
 
 ## Why now: AI writes the specs, vstack keeps it honest
 
@@ -320,33 +208,17 @@ The new failure mode is **reward hacking**. In [Hao AI Lab's](https://haoailab.c
 
 | Gate | What it enforces | Where it showed up in the LoRA example |
 | --- | --- | --- |
-| Role isolation | Coordinator, worker and red-team agents are kept separate | I reviewed the spec and the results myself |
-| Hash-pinned specs | SHA-256 locks the approved safety properties, so they cannot be quietly weakened | NoStaleWeights never changed after step 1 |
-| Line-anchored models | Every state variable and action maps to `file:line@commit` | The variable-to-code mapping in step 2 |
+| Role isolation | Coordinator, worker and red-team agents are kept separate | I approved the rule and reviewed the results myself |
+| Hash-pinned specs | SHA-256 locks the approved safety properties, so they cannot be quietly weakened | The rule never changed after step 1 |
+| Line-anchored models | Every state variable and action maps to `file:line@commit` | Each action tied to the code in step 2 |
 | Mutation and trace gates | The old bug must fail, the fix must pass, removing a guard must fail again, and logs from real runs must replay as valid model behaviors | Step 5 (without trace replay) |
-| Proof and runtime checks | TLAPS proofs for critical state machines, with preconditions mirrored as runtime checks | FreshCache in step 6 |
+| Proof and runtime checks | TLAPS proofs for critical state machines, with preconditions mirrored as runtime checks | The strengthened invariant in step 6 |
 
 The blog summarizes the workflow as five steps (specification, abstraction, validation, verification, continuous checking). The repo splits it into nine stage skills:
 
 {{fig:vstack-stages|vstack's stage skills. Orange: what the LoRA example walked through (S4 without trace replay; no TLAPS proof was run, so S7 is not marked).}}
 
-Using it looks like this:
-
-```bash
-# install from the command line
-git clone https://github.com/hao-ai-lab/vstack.git
-cd vstack && uv tool install -e .
-vstack setup    # checks Java/TLC/Z3, installs skills into Claude Code, Codex or Cursor
-
-# or as a plugin: in Claude Code
-/plugin marketplace add hao-ai-lab/vstack
-/plugin install vstack
-# in Cursor
-/add-plugin vstack
-
-# then: one module plus one safety property
-/vstack-mode verify that our RDMA KV cache lease manager never recycles an in-flight page on timeout.
-```
+You point it at one module with one safety property, for example `/vstack-mode verify that our RDMA KV cache lease manager never recycles an in-flight page on timeout.`, and it walks the agent through the stages.
 
 Even with vstack, three steps stay with a human: approving the spec, judging whether a counterexample is real and reproducing it on hardware, and reviewing the assumption list at the end.
 

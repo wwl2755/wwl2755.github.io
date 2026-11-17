@@ -32,15 +32,9 @@
 </ul>
 </li>
 <li><a href="#the-pd-bug-is-a-dilemma-not-a-bad-timeout-value">The PD bug is a dilemma, not a bad timeout value</a></li>
-<li><a href="#a-worked-example-an-80-line-model-of-a-real-vllm-bug">A worked example: an 80-line model of a real vLLM bug</a><ul>
-<li><a href="#the-setup">The setup</a></li>
-<li><a href="#reading-the-tla-below">Reading the TLA+ below</a></li>
-<li><a href="#step-1-the-spec-is-a-design-decision">Step 1: the spec is a design decision</a></li>
-<li><a href="#step-2-abstract">Step 2: abstract</a></li>
-<li><a href="#step-3-model">Step 3: model</a></li>
-<li><a href="#step-4-run-tlc">Step 4: run TLC</a></li>
-<li><a href="#step-5-check-that-the-model-is-not-lying">Step 5: check that the model is not lying</a></li>
-<li><a href="#step-6-from-bounded-to-any-scale">Step 6: from bounded to any scale</a></li>
+<li><a href="#a-worked-example-modeling-a-real-vllm-bug">A worked example: modeling a real vLLM bug</a><ul>
+<li><a href="#the-bug">The bug</a></li>
+<li><a href="#modeling-it-step-by-step">Modeling it, step by step</a></li>
 <li><a href="#what-this-does-not-prove">What this does not prove</a></li>
 </ul>
 </li>
@@ -58,16 +52,10 @@
 <h2 id="how-a-late-kv-write-leaks-data">How a late KV write leaks data<a class="headerlink" href="#how-a-late-kv-write-leaks-data" title="Link to this section">#</a></h2>
 <p>A closely related PD failure, which veriserve studies in depth, needs no misconfiguration at all: a Decode instance times out waiting for a request's KV cache, frees that request's KV pages, and hands them to a new request. Meanwhile the Prefill instance's RDMA write for the old request is still queued on the NIC, and it lands in the new request's pages. Nothing crashes and no error is logged. The new user just gets an answer polluted by another user's context.</p>
 <h3 id="how-the-kv-gets-there">How the KV gets there<a class="headerlink" href="#how-the-kv-gets-there" title="Link to this section">#</a></h3>
-<p>Taking SGLang with a push-style transfer backend (Mooncake) as the example, one KV transfer has four steps:</p>
+<p>In PD disaggregation, Decode reserves KV pages for the request and tells Prefill which pages to fill. Prefill computes the KV, and its NIC writes it straight into Decode's GPU memory with one-sided RDMA. When the write is done, Prefill sends a done notice, and only then does Decode use the pages.</p>
 <figure id="fig-pd-transfer"><svg class='fig' viewBox='0 0 760 458' role='img' aria-label='One KV transfer in PD disaggregation' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='pdt-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='pdt-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='pdt-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='pdt-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='pdt-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='pdt-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>One KV transfer in PD disaggregation (SGLang + Mooncake, push style)</text><rect x='25.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='100' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Router</text><line x1='100' y1='84' x2='100' y2='446' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><rect x='305.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='380' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Prefill</text><line x1='380' y1='84' x2='380' y2='446' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><rect x='585.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='660' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Decode</text><line x1='660' y1='84' x2='660' y2='446' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><path d='M100 118H376' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#pdt-arr-line)'/><path d='M100 140H656' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#pdt-arr-line)'/><text x='112' y='110' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>1  request + bootstrap room</text><rect x='590' y='170' width='140' height='34' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='1.5'/><text x='660' y='192' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>allocate pages</text><path d='M590 228H384' fill='none' stroke='var(--accent2)' stroke-width='1.4' marker-end='url(#pdt-arr-accent2)'/><text x='520.0' y='220' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>2  destination KV page indices</text><rect x='310' y='256' width='140' height='34' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.5'/><text x='380' y='278' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>compute KV</text><path d='M450 300H656' fill='none' stroke='var(--accent)' stroke-width='3' marker-end='url(#pdt-arr-accent)'/><text x='646' y='324' font-size='12.5' text-anchor='end' font-weight='600' fill='var(--accent)'>3  RDMA WRITE into Decode GPU memory</text><text x='646' y='342' font-size='12' text-anchor='end' font-weight='400' fill='var(--muted)' font-style='italic'>one-sided: Decode&#x27;s CPU never sees it</text><path d='M380 380H656' fill='none' stroke='var(--line)' stroke-width='1.4' stroke-dasharray='5 4' marker-end='url(#pdt-arr-line)'/><text x='520.0' y='372' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>4  done notice (after the write completes)</text><rect x='580' y='400' width='160' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='660' y='422' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>pages go to attention</text></svg><figcaption>One KV transfer. Decode chooses the pages; Prefill&#x27;s NIC writes into them directly.</figcaption></figure>
 
-<ol>
-<li>The router assigns the request a bootstrap room (a transfer session id) and sends it to both Prefill and Decode.</li>
-<li>Decode <strong>pre-allocates</strong> KV pages in its own pool and tells Prefill which pages to write (the destination KV indices).</li>
-<li>Prefill computes the KV and posts an <strong>RDMA WRITE</strong>: the NIC writes straight into Decode's GPU memory (GPUDirect RDMA).</li>
-<li>Once the write is done, Prefill sends a done notice. Only then does Decode hand the pages to attention.</li>
-</ol>
-<p>Three properties of one-sided RDMA make this fragile:</p>
+<p>Three properties make this fragile:</p>
 <ul>
 <li><strong>One-sided:</strong> Decode's CPU is not involved and cannot see when the write happens.</li>
 <li><strong>Not cancellable:</strong> in <a href="https://haoailab.com/blogs/verifiable-llm-infra/">Hao AI Lab's</a> words, one-sided transfers already queued on the NIC "cannot be canceled in hardware on the studied transport paths".</li>
@@ -247,22 +235,15 @@
 <p><a href="https://haoailab.com/blogs/verifiable-llm-infra/">Hao AI Lab's blog</a> proves this is not a tuning problem. When delays have no upper bound, a slow write and a dead peer look exactly the same from Decode's side, so no rule based only on what Decode can see can guarantee both. veriserve's way out is to separate what happens to the <strong>request</strong> from what happens to its <strong>pages</strong>:</p>
 <figure id="fig-pd-fix"><svg class='fig' viewBox='0 0 760 278' role='img' aria-label='PdLedger page states after a release or timeout' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='fix-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='fix-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='fix-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='fix-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='fix-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='fix-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>A page is reused only after proof that the write stopped</text><path d='M194 170H266' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#fix-arr-line)'/><path d='M440 162H480V110H532' fill='none' stroke='var(--good)' stroke-width='1.4' marker-end='url(#fix-arr-good)'/><path d='M440 178H480V230H532' fill='none' stroke='var(--bad)' stroke-width='1.4' marker-end='url(#fix-arr-bad)'/><rect x='24' y='142' width='170' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='109.0' y='166' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>PRIVATE</text><text x='109.0' y='186' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>in use by one request</text><rect x='270' y='142' width='170' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='355.0' y='166' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>DRAINING</text><text x='355.0' y='186' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>waits for stop evidence</text><text x='355' y='222' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)' font-style='italic'>its request has already failed</text><rect x='536' y='82' width='200' height='56' rx='8' fill='var(--card)' stroke='var(--good)' stroke-width='1.8'/><text x='636.0' y='106' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>FREE</text><text x='636.0' y='126' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>ACK: the write has stopped</text><rect x='536' y='202' width='200' height='56' rx='8' fill='var(--card)' stroke='var(--bad)' stroke-width='1.8'/><text x='636.0' y='226' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>QUARANTINED</text><text x='636.0' y='246' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>no proof: never reused</text><text x='230' y='152' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>release or</text><text x='230' y='164' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>timeout</text><text x='506' y='102' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>ACK</text><text x='506' y='248' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>no ACK</text></svg><figcaption>PdLedger page states when a request ends or times out. Simplified: the ledger tracks six states in all, adding SHARED and DUP for prefix sharing.</figcaption></figure>
 
-<p>On a timeout the request fails and returns at once, so it never hangs. Its pages go to DRAINING, not FREE, and Decode sends an ABORT asking Prefill whether the write has stopped.</p>
-<ul>
-<li><strong>Prefill acknowledges only what it can prove:</strong> the write was never handed to the NIC (it is cancelled, and a tombstone makes any later post of it fail), or the write has completed. With that ACK, the pages go back to FREE.</li>
-<li><strong>No proof means quarantine:</strong> if the ACK times out, Prefill reports a failed write it cannot vouch for, or the peer is lost, the pages go to QUARANTINED and are never reused for the life of the process. A late write can then only land in a page nobody uses.</li>
-<li><strong>Generations reject stale messages:</strong> every page carries a (page, gen) ticket and transfer ids are never reused. A done notice or ACK that does not match the peer, room, generation and transfer id is dropped. This closes a second bug family, where a message from an old session is taken for the current one.</li>
-<li><strong>Prefill reports done only when it is true:</strong> the done notice goes out after every block has completed locally, not when the write is posted, because a notice sent at submission can overtake the data.</li>
-</ul>
+<p>On a timeout the request fails at once, so it never hangs, but its pages go to DRAINING instead of FREE. A page returns to FREE only with evidence that the write has stopped: Prefill confirms the write either never reached the NIC or has completed. Without that evidence the page is QUARANTINED and never reused, so a late write can only land in a page nobody uses. Version numbers on pages and transfers make a stale message from an earlier session harmless.</p>
 <p>The cost is a few pages lost for good when something goes wrong. Across six paired runs against an unverified bypass baseline, <a href="https://haoailab.com/blogs/verifiable-llm-infra/">the blog</a> measures PdLedger at +0.18% mean p50 TPOT (95% CI −0.32% to +0.68%). Note what is proven: the TLAPS proof covers safety only. Finality, the request failing fast instead of hanging, is runtime behavior outside the proof.</p>
-<p>Upstream, <a href="https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies">veriserve's case studies</a> split the SGLang issues in two. Room-reuse identity confusion has five local fix PRs (<a href="https://github.com/sgl-project/sglang/pull/48883">#48883</a>, <a href="https://github.com/sgl-project/sglang/pull/48889">#48889</a>, <a href="https://github.com/sgl-project/sglang/pull/48960">#48960</a>, <a href="https://github.com/sgl-project/sglang/pull/48979">#48979</a>, <a href="https://github.com/sgl-project/sglang/pull/48982">#48982</a>), all open and unmerged when the case studies were checked on 2026-11-08 (they apply the generation idea above). Treating a timeout or an error as "the remote side has stopped" is filed as architectural, with no local PR, because no local patch escapes the dilemma; it needs a page state machine like this one.</p>
-<h2 id="a-worked-example-an-80-line-model-of-a-real-vllm-bug">A worked example: an 80-line model of a real vLLM bug<a class="headerlink" href="#a-worked-example-an-80-line-model-of-a-real-vllm-bug" title="Link to this section">#</a></h2>
-<p>To learn the workflow end to end, I modeled one bug from vstack's <a href="https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0">verified bug list</a>: after a LoRA hot reload, new requests can silently run on old weights (<a href="https://github.com/vllm-project/vllm/pull/67459">vLLM PR #67459</a>). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. Every TLC result quoted here is a real run. Files: <a href="/assets/models/LoraReload.tla">LoraReload.tla</a>, <a href="/assets/models/bug.cfg">bug.cfg</a>, <a href="/assets/models/fix.cfg">fix.cfg</a>, <a href="/assets/models/reach.cfg">reach.cfg</a>.</p>
-<h3 id="the-setup">The setup<a class="headerlink" href="#the-setup" title="Link to this section">#</a></h3>
+<p>In upstream SGLang, the stale-message bugs have local fix PRs (<a href="https://github.com/sgl-project/sglang/pull/48883">#48883</a>, <a href="https://github.com/sgl-project/sglang/pull/48889">#48889</a>, <a href="https://github.com/sgl-project/sglang/pull/48960">#48960</a>, <a href="https://github.com/sgl-project/sglang/pull/48979">#48979</a>, <a href="https://github.com/sgl-project/sglang/pull/48982">#48982</a>), but treating a timeout as "the remote side has stopped" is classed as architectural: no local patch escapes the dilemma (<a href="https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies">veriserve case studies</a>).</p>
+<h2 id="a-worked-example-modeling-a-real-vllm-bug">A worked example: modeling a real vLLM bug<a class="headerlink" href="#a-worked-example-modeling-a-real-vllm-bug" title="Link to this section">#</a></h2>
+<p>To learn the workflow end to end, I modeled one bug from vstack's <a href="https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0">verified bug list</a>: after a LoRA hot reload, new requests can silently run on old weights (<a href="https://github.com/vllm-project/vllm/pull/67459">vLLM PR #67459</a>). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. It is about 80 lines of TLA+ (<a href="/assets/models/LoraReload.tla">LoraReload.tla</a>), and every result below is from a real TLC run.</p>
+<h3 id="the-bug">The bug<a class="headerlink" href="#the-bug" title="Link to this section">#</a></h3>
 <figure id="fig-lora-ledgers"><svg class='fig' viewBox='0 0 760 276' role='img' aria-label='vLLM keeps LoRA state in two ledgers' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='lora-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='lora-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='lora-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='lora-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='lora-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='lora-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>Two ledgers, plus a copy in every queued request</text><rect x='24' y='56' width='210' height='92' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='129.0' y='80' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>front-end ledger</text><text x='129.0' y='100' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>serving.py</text><text x='129.0' y='118' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>name → LoRARequest</text><text x='129.0' y='136' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>(id, path)</text><rect x='284' y='56' width='190' height='92' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='379.0' y='80' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>queued request r</text><text x='379.0' y='100' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>carries the LoRARequest</text><text x='379.0' y='118' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>current at admission</text><rect x='524' y='56' width='212' height='92' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='630.0' y='80' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>worker ledger</text><text x='630.0' y='100' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>worker_manager.py</text><text x='630.0' y='118' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>CPU LRU cache: id → weights</text><text x='630.0' y='136' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>capacity max_cpu_loras</text><path d='M234 102H280' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#lora-arr-line)'/><path d='M474 102H520' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#lora-arr-line)'/><text x='257' y='172' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>at admission</text><text x='497' y='172' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>add_adapter()</text><rect x='24' y='196' width='712' height='64' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25' stroke-dasharray='5 4'/><text x='40' y='222' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>hot reload (load_inplace=True): the worker reloads from the new path and the front end points at it,</text><text x='40' y='242' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>but requests already queued still carry the old path; a cache miss loads whatever path the request carries.</text></svg><figcaption>The front end, the queued request and the worker can each hold a different idea of which weights adapter A means.</figcaption></figure>
 
-<p>vLLM keeps LoRA state in two ledgers. The front end maps each adapter name to a <code>LoRARequest</code> (an int id plus a weight path), and every incoming request carries the <code>LoRARequest</code> that was current when it was admitted. Each worker keeps a CPU LRU cache from id to loaded weights. <code>add_adapter</code> loads from the request's own path on a cache miss, and reuses the cached weights on a hit without looking at the path. A hot reload (<code>/load_lora_adapter</code> with <code>load_inplace=True</code>) reloads the worker and points the front end at the new path.</p>
-<p>The bug, in five events:</p>
+<p>vLLM keeps two records of which weights a LoRA adapter means: the front end's (name → weight path) and each worker's CPU cache of loaded weights. Every queued request carries the path that was current when it arrived. On a cache miss the worker loads from the request's path; on a hit it reuses the cached weights without checking. A hot reload switches both records to the new path, in five events:</p>
 <ol>
 <li>Adapter A is at v1. Request r1 arrives carrying "A → v1" and waits in the queue.</li>
 <li>A is hot-reloaded to v2. The worker cache and the front end both now say v2.</li>
@@ -270,142 +251,21 @@
 <li>r1 is scheduled. A is not cached, so it is loaded from r1's stale path: <strong>the cache goes back to v1</strong>.</li>
 <li>New request r2 carries "A → v2", finds A in the cache, and <strong>runs on v1 weights with no error</strong>.</li>
 </ol>
-<p>The victim (r2) is not the culprit (r1), which is why per-request assertions miss it. The bug also needs more adapters than <code>max_cpu_loras</code>; single-adapter setups are unaffected.</p>
-<h3 id="reading-the-tla-below">Reading the TLA+ below<a class="headerlink" href="#reading-the-tla-below" title="Link to this section">#</a></h3>
-<p>TLA+ describes the same kind of state machine as the Python sketch earlier. <code>Reqs</code> is the set of requests in the model (r1, r2, …). The model's state is seven variables:</p>
+<p>The victim (r2) is not the culprit (r1), which is why per-request assertions miss it. The bug also needs more adapters than the CPU cache holds; single-adapter setups are unaffected.</p>
+<h3 id="modeling-it-step-by-step">Modeling it, step by step<a class="headerlink" href="#modeling-it-step-by-step" title="Link to this section">#</a></h3>
+<ol>
+<li><strong>Write the spec. It is a design decision.</strong> The obvious spec, "every request runs the version it arrived with", is wrong: the upstream fix runs r1 on v2 too, which is what a hot reload should mean. The rule I chose: once a request is done, the version it ran on is at least the version it arrived with. Old requests may get newer weights; new requests must never get older ones.</li>
+<li><strong>Abstract.</strong> Paths become version numbers. The cache holds one adapter and there are only two, A and B, which is enough to evict A. Tensors, GPUs and tensor parallelism are dropped. The hot reload is modeled as one atomic step, an assumption to revisit later. What remains is 7 variables and 4 actions: a request arrives, a hot reload, another adapter evicts A, a request runs.</li>
+<li><strong>Model both versions of the code.</strong> One switch selects the code before or after the patch. The fix: the worker remembers the latest hot-reload source and loads from it on a cache miss.</li>
+<li><strong>Check it.</strong> With 2 requests and 2 versions, TLC finds the violation in under a second. Its counterexample is exactly the five events above, as 7 states (the start plus 6 steps, because r2 arriving is its own step), and it is the shortest one possible.</li>
+</ol>
+<figure id="fig-lora-trace"><svg class='fig' viewBox='0 0 760 326' role='img' aria-label='TLC counterexample for the LoRA hot-reload bug' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='trace-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='trace-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='trace-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='trace-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='trace-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='trace-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>TLC&#x27;s counterexample: the worker cache falls behind the front end at state 5</text><line x1='100' y1='90' x2='716' y2='90' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='94' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>v2</text><line x1='100' y1='170' x2='716' y2='170' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='174' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>v1</text><line x1='100' y1='230' x2='716' y2='230' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='234' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>not cached</text><polyline points='120,166 216,166 312,86 408,86 504,86 600,86 696,86' fill='none' stroke='var(--accent2)' stroke-width='2.4'/><polyline points='120,174 216,174 312,94 408,234 504,174 600,174 696,174' fill='none' stroke='var(--accent)' stroke-width='2.4' stroke-dasharray='6 4'/><circle cx='120' cy='174' r='4' fill='var(--accent)'/><circle cx='216' cy='174' r='4' fill='var(--accent)'/><circle cx='312' cy='94' r='4' fill='var(--accent)'/><circle cx='408' cy='234' r='4' fill='var(--accent)'/><circle cx='504' cy='174' r='4' fill='var(--accent)'/><circle cx='600' cy='174' r='4' fill='var(--accent)'/><circle cx='696' cy='174' r='4' fill='var(--accent)'/><text x='120' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>1</text><text x='120' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>init</text><text x='216' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>2</text><text x='216' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Admit r1</text><text x='312' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>3</text><text x='312' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Reload</text><text x='408' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>4</text><text x='408' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>UseB</text><text x='504' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>5</text><text x='504' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Run r1</text><text x='600' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>6</text><text x='600' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Admit r2</text><text x='696' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>7</text><text x='696' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Run r2</text><circle cx='696' cy='174' r='9' fill='none' stroke='var(--bad)' stroke-width='2'/><text x='504' y='154' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--accent)'>cache holds v1, front end says v2</text><text x='712' y='202' font-size='12.5' text-anchor='end' font-weight='600' fill='var(--bad)'>r2 carries v2, runs v1</text><line x1='120' y1='306' x2='150' y2='306' stroke='var(--accent2)' stroke-width='2.4'/><text x='158' y='310' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>registered version (front end)</text><line x1='420' y1='306' x2='450' y2='306' stroke='var(--accent)' stroke-width='2.4' stroke-dasharray='6 4'/><text x='458' y='310' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>adapter A in the worker cache</text></svg><figcaption>TLC&#x27;s counterexample, plotted (numbers are states, not the five events above). At state 5 the cache holds v1 while the front end says v2; at state 7 r2 runs on v1 and the rule fails.</figcaption></figure>
+
 <table>
 <thead>
 <tr>
-<th>Variable</th>
-<th>Meaning</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>reg</code></td>
-<td>the version of adapter A the front end currently points to (1, 2, …)</td>
-</tr>
-<tr>
-<td><code>cacheA</code></td>
-<td>the version of A in the worker's CPU cache, 0 if not cached</td>
-</tr>
-<tr>
-<td><code>cacheB</code></td>
-<td>whether adapter B is in the cache (capacity is 1, so A and B evict each other)</td>
-</tr>
-<tr>
-<td><code>inplaceSrc</code></td>
-<td>the latest hot-reload version the worker remembers (used only by the fixed code), 0 if none</td>
-</tr>
-<tr>
-<td><code>status[r]</code></td>
-<td>request r's state: <code>"idle"</code>, <code>"queued"</code> or <code>"done"</code></td>
-</tr>
-<tr>
-<td><code>snap[r]</code></td>
-<td>the version request r carried when it was admitted</td>
-</tr>
-<tr>
-<td><code>used[r]</code></td>
-<td>the version request r actually ran on</td>
-</tr>
-</tbody>
-</table>
-<p>The syntax you need:</p>
-<table>
-<thead>
-<tr>
-<th>TLA+</th>
-<th>Meaning</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>X == …</code></td>
-<td>define X</td>
-</tr>
-<tr>
-<td><code>/\</code>  <code>\/</code></td>
-<td>and, or (a list of <code>/\</code> lines must all hold)</td>
-</tr>
-<tr>
-<td><code>\A r \in S : …</code></td>
-<td>for every r in S</td>
-</tr>
-<tr>
-<td><code>=&gt;</code>  <code>#</code></td>
-<td>implies, not equal</td>
-</tr>
-<tr>
-<td><code>x'</code></td>
-<td>the value of x after this step</td>
-</tr>
-<tr>
-<td><code>[f EXCEPT ![r] = v]</code></td>
-<td>f with only entry r changed to v</td>
-</tr>
-<tr>
-<td><code>UNCHANGED &lt;&lt;x, y&gt;&gt;</code></td>
-<td>x and y keep their values this step</td>
-</tr>
-<tr>
-<td><code>LET … IN …</code></td>
-<td>local definitions</td>
-</tr>
-<tr>
-<td><code>\*</code></td>
-<td>comment</td>
-</tr>
-</tbody>
-</table>
-<p>An action such as <code>Run(r)</code> is a list of conditions on the state before (unprimed) and after (primed) one step. The step can happen only when all of them can be true.</p>
-<h3 id="step-1-the-spec-is-a-design-decision">Step 1: the spec is a design decision<a class="headerlink" href="#step-1-the-spec-is-a-design-decision" title="Link to this section">#</a></h3>
-<p>The obvious spec, "every request runs the version it was admitted with", is wrong: the upstream fix runs r1 on v2 too, which is what a hot reload should mean. The policy I chose is that old requests may run on newer weights, but new requests must never run on older ones:</p>
-<div class="highlight"><pre><span></span><code>NoStaleWeights == \A r \in Reqs : status[r] = "done" =&gt; used[r] &gt;= snap[r]
-</code></pre></div>
-
-<p>In words: for every request, once it is done, the version it ran on is at least the version it was admitted with.</p>
-<h3 id="step-2-abstract">Step 2: abstract<a class="headerlink" href="#step-2-abstract" title="Link to this section">#</a></h3>
-<p>Paths become version numbers. The cache gets capacity 1 with only adapters A and B, which is enough to evict A. All of B's traffic collapses into one action, <code>UseB</code>. Tensors, GPU slots and tensor parallelism are dropped. One simplification is recorded as an assumption: the hot reload is modeled as a single atomic step. The model has 7 variables and 4 actions (<code>Admit</code>, <code>Reload</code>, <code>UseB</code>, <code>Run</code>), each mapped back to a code location.</p>
-<h3 id="step-3-model">Step 3: model<a class="headerlink" href="#step-3-model" title="Link to this section">#</a></h3>
-<p>The upstream fix makes the worker remember the latest hot-reload source for each adapter id and load from it on a cache miss. A constant <code>FIX</code> lets one model describe the code before (<code>FALSE</code>) and after (<code>TRUE</code>) the patch. <code>Reload</code> is where the fix records the source:</p>
-<div class="highlight"><pre><span></span><code>Reload ==
-  /\ reg &lt; MaxVer                      \* MaxVer bounds the number of versions
-  /\ reg' = reg + 1
-  /\ cacheA' = reg + 1                 \* the worker reloads A right away
-  /\ cacheB' = FALSE                   \* capacity 1: loading A evicts B
-  /\ inplaceSrc' = IF FIX THEN reg + 1 ELSE inplaceSrc
-  /\ UNCHANGED &lt;&lt;status, snap, used&gt;&gt;
-</code></pre></div>
-
-<p>The key action, <code>Run</code>, is a direct translation of <code>add_adapter</code>:</p>
-<div class="highlight"><pre><span></span><code>Run(r) ==
-  /\ status[r] = "queued"
-  /\ LET loadVer == IF FIX /\ inplaceSrc # 0
-                     THEN inplaceSrc   \* fixed: newest hot-reload source
-                     ELSE snap[r]      \* original: the request's stale path
-         ver == IF cacheA = 0 THEN loadVer   \* miss: load
-                              ELSE cacheA    \* hit: reuse
-     IN /\ cacheA' = ver
-        /\ cacheB' = IF cacheA = 0 THEN FALSE ELSE cacheB  \* a load evicts B
-        /\ used' = [used EXCEPT ![r] = ver]
-  /\ status' = [status EXCEPT ![r] = "done"]
-  /\ UNCHANGED &lt;&lt;reg, inplaceSrc, snap&gt;&gt;
-</code></pre></div>
-
-<h3 id="step-4-run-tlc">Step 4: run TLC<a class="headerlink" href="#step-4-run-tlc" title="Link to this section">#</a></h3>
-<div class="highlight"><pre><span></span><code>java<span class="w"> </span>-cp<span class="w"> </span>tla2tools.jar<span class="w"> </span>tlc2.TLC<span class="w"> </span>-deadlock<span class="w"> </span>-config<span class="w"> </span>bug.cfg<span class="w"> </span>LoraReload
-</code></pre></div>
-
-<p><code>bug.cfg</code> sets 2 requests, 2 versions and <code>FIX = FALSE</code>. TLC finds the violation in under a second and prints the five events above as a trace of 7 states (the start state plus 6 steps; admitting r2 is its own step), the shortest one possible:</p>
-<figure id="fig-lora-trace"><svg class='fig' viewBox='0 0 760 326' role='img' aria-label='TLC counterexample for the LoRA hot-reload bug' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='trace-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='trace-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='trace-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='trace-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='trace-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='trace-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>TLC&#x27;s counterexample: the worker cache falls behind the front end at state 5</text><line x1='100' y1='90' x2='716' y2='90' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='94' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>v2</text><line x1='100' y1='170' x2='716' y2='170' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='174' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>v1</text><line x1='100' y1='230' x2='716' y2='230' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='234' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>not cached</text><polyline points='120,166 216,166 312,86 408,86 504,86 600,86 696,86' fill='none' stroke='var(--accent2)' stroke-width='2.4'/><polyline points='120,174 216,174 312,94 408,234 504,174 600,174 696,174' fill='none' stroke='var(--accent)' stroke-width='2.4' stroke-dasharray='6 4'/><circle cx='120' cy='174' r='4' fill='var(--accent)'/><circle cx='216' cy='174' r='4' fill='var(--accent)'/><circle cx='312' cy='94' r='4' fill='var(--accent)'/><circle cx='408' cy='234' r='4' fill='var(--accent)'/><circle cx='504' cy='174' r='4' fill='var(--accent)'/><circle cx='600' cy='174' r='4' fill='var(--accent)'/><circle cx='696' cy='174' r='4' fill='var(--accent)'/><text x='120' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>1</text><text x='120' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>init</text><text x='216' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>2</text><text x='216' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Admit r1</text><text x='312' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>3</text><text x='312' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Reload</text><text x='408' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>4</text><text x='408' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>UseB</text><text x='504' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>5</text><text x='504' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Run r1</text><text x='600' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>6</text><text x='600' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Admit r2</text><text x='696' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>7</text><text x='696' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Run r2</text><circle cx='696' cy='174' r='9' fill='none' stroke='var(--bad)' stroke-width='2'/><text x='504' y='154' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--accent)'>cache holds v1, front end says v2</text><text x='712' y='202' font-size='12.5' text-anchor='end' font-weight='600' fill='var(--bad)'>r2 carries v2, runs v1</text><line x1='120' y1='306' x2='150' y2='306' stroke='var(--accent2)' stroke-width='2.4'/><text x='158' y='310' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>registered version (front end)</text><line x1='420' y1='306' x2='450' y2='306' stroke='var(--accent)' stroke-width='2.4' stroke-dasharray='6 4'/><text x='458' y='310' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>adapter A in the worker cache</text></svg><figcaption>TLC&#x27;s 7-state counterexample, plotted (numbers are states, not the five events above). At state 5 the cache holds v1 while the front end says v2; at state 7 r2 runs on v1 and NoStaleWeights fails.</figcaption></figure>
-
-<p>With <code>FIX = TRUE</code> the violation disappears. "Distinct states" is the number of different states TLC reached and checked:</p>
-<table>
-<thead>
-<tr>
-<th>Config</th>
-<th>Distinct states</th>
+<th>Configuration</th>
+<th>Distinct states checked</th>
 <th>Result</th>
 </tr>
 </thead>
@@ -413,7 +273,7 @@
 <tr>
 <td>Original code, 2 requests, 2 versions</td>
 <td>89</td>
-<td>NoStaleWeights violated, 7-state trace</td>
+<td>Rule violated, 7-state trace</td>
 </tr>
 <tr>
 <td>Fixed code, 2 requests, 2 versions</td>
@@ -427,26 +287,12 @@
 </tr>
 </tbody>
 </table>
-<p>A beginner trap: the first run of the fixed model reported "Deadlock reached". Once every request is done the model has nothing left to do, which TLC treats as deadlock by default. Here that is normal termination, so pass <code>-deadlock</code>, which tells TLC not to report it.</p>
-<h3 id="step-5-check-that-the-model-is-not-lying">Step 5: check that the model is not lying<a class="headerlink" href="#step-5-check-that-the-model-is-not-lying" title="Link to this section">#</a></h3>
-<p>A property passes either because it is true, or because the bad state is unreachable in your model. Three checks separate the two:</p>
-<ul>
-<li><strong>The historical bug must fail</strong> on the original model. It does.</li>
-<li><strong>Mutation:</strong> in the fixed model, change <code>Reload</code>'s <code>inplaceSrc'</code> line to <code>inplaceSrc' = inplaceSrc</code>, so the new source is never recorded. The fixed model fails again, so that line is load-bearing.</li>
-<li><strong>Reachability witness:</strong> assert something that <em>should</em> be violated ("no request admitted after a reload ever finishes"). TLC breaks it at the 4th state, so the interesting path is reachable.</li>
-</ul>
-<h3 id="step-6-from-bounded-to-any-scale">Step 6: from bounded to any scale<a class="headerlink" href="#step-6-from-bounded-to-any-scale" title="Link to this section">#</a></h3>
-<p>The fact that carries the proof is a strengthened invariant:</p>
-<div class="highlight"><pre><span></span><code>FreshCache ==
-  /\ cacheA \in {0, reg}              \* cacheA is 0 or reg: absent or newest
-  /\ (reg &gt; 1 =&gt; inplaceSrc = reg)    \* a reload always records its source
-  /\ \A r \in Reqs : snap[r] &lt;= reg   \* no request holds a future version
-</code></pre></div>
-
-<p>This is the strengthening from the induction section. The first line is the real point and states the bug in one sentence: the worker cache must never be older than the front end. The other two lines are what make it inductive: line 2 says the source a cache miss would load from is always the newest, and line 3 rules out impossible states where a request holds a version from the future. On the original model TLC reports the second line failing right after the first reload, because the old code never records a source; the first line would fail later too, at state 5 of the trace above.</p>
-<p>TLC confirms FreshCache holds in every reachable state of the fixed model with 3 requests and 3 versions. That alone is not a proof that it is inductive. Proving that with TLAPS would extend the result to any number of requests and versions.</p>
+<ol start="5">
+<li><strong>Make sure the model is not lying.</strong> A rule can pass because it is true, or because the model cannot even reach the bad state. Three checks tell them apart. The original code must fail; it does. A mutation, stopping the fixed code from recording the new source, must fail again; it does, so that part of the fix is load-bearing. A reachability witness, a claim that <em>should</em> fail ("no request that arrives after a reload ever finishes"), must fail; TLC breaks it in 4 states, so the interesting path is reachable.</li>
+<li><strong>Strengthen it for any scale.</strong> The fact that actually carries the proof: the worker's cached copy of A is either absent or the newest version. Two helper facts make it inductive: a reload always records its source, and no request holds a version from the future. This is the strengthening from the induction section, and its main line states the bug in one sentence: the worker cache must never be older than the front end. TLC confirms it in every reachable state with 3 requests and 3 versions, and on the original code it fails right after the first reload. A TLAPS proof would extend the result to any number of requests and versions; checking reachable states alone does not.</li>
+</ol>
 <h3 id="what-this-does-not-prove">What this does not prove<a class="headerlink" href="#what-this-does-not-prove" title="Link to this section">#</a></h3>
-<p>The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. <a href="https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0">vstack's entry for this bug</a> also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting <code>Reload</code> into two actions is a good exercise.</p>
+<p>The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. <a href="https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0">vstack's entry for this bug</a> also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting the hot reload into two steps is a good exercise.</p>
 <h2 id="why-now-ai-writes-the-specs-vstack-keeps-it-honest">Why now: AI writes the specs, vstack keeps it honest<a class="headerlink" href="#why-now-ai-writes-the-specs-vstack-keeps-it-honest" title="Link to this section">#</a></h2>
 <p>Formal methods are decades old. What changed is cost. Hand-written specs and proofs took months, while vLLM and SGLang merge new code every day. LLMs can now read a large codebase and produce specs and proofs quickly. Proof checkers are strict, so a fake proof is rejected: the failure mode is "could not prove it", not "hallucinated a proof".</p>
 <p>The new failure mode is <strong>reward hacking</strong>. In <a href="https://haoailab.com/blogs/verifiable-llm-infra/">Hao AI Lab's</a> words, when a checker finds a race, a naive coding agent "weakens the invariant, deletes the timeout branch from the model" instead of surfacing the real bug, until the checker says 0 errors.</p>
@@ -463,17 +309,17 @@
 <tr>
 <td>Role isolation</td>
 <td>Coordinator, worker and red-team agents are kept separate</td>
-<td>I reviewed the spec and the results myself</td>
+<td>I approved the rule and reviewed the results myself</td>
 </tr>
 <tr>
 <td>Hash-pinned specs</td>
 <td>SHA-256 locks the approved safety properties, so they cannot be quietly weakened</td>
-<td>NoStaleWeights never changed after step 1</td>
+<td>The rule never changed after step 1</td>
 </tr>
 <tr>
 <td>Line-anchored models</td>
 <td>Every state variable and action maps to <code>file:line@commit</code></td>
-<td>The variable-to-code mapping in step 2</td>
+<td>Each action tied to the code in step 2</td>
 </tr>
 <tr>
 <td>Mutation and trace gates</td>
@@ -483,29 +329,14 @@
 <tr>
 <td>Proof and runtime checks</td>
 <td>TLAPS proofs for critical state machines, with preconditions mirrored as runtime checks</td>
-<td>FreshCache in step 6</td>
+<td>The strengthened invariant in step 6</td>
 </tr>
 </tbody>
 </table>
 <p>The blog summarizes the workflow as five steps (specification, abstraction, validation, verification, continuous checking). The repo splits it into nine stage skills:</p>
 <figure id="fig-vstack-stages"><svg class='fig' viewBox='0 0 760 384' role='img' aria-label='vstack&#x27;s nine stages' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='vs-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='vs-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='vs-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='vs-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='vs-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='vs-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>vstack&#x27;s nine stages (orange: what the LoRA example walked through)</text><rect x='24' y='52' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='132.0' y='76' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S0  decompose</text><text x='132.0' y='96' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>control, data, boundaries;</text><text x='132.0' y='114' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>historical bug anchors</text><rect x='272' y='52' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='380.0' y='76' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S1  select</text><text x='380.0' y='96' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>tool and assurance</text><text x='380.0' y='114' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>tier per property</text><rect x='520' y='52' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='628.0' y='76' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S2  spec</text><text x='628.0' y='96' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>owner approves;</text><text x='628.0' y='114' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>hash-pinned</text><rect x='520' y='168' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='628.0' y='192' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S3  model</text><text x='628.0' y='212' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>from pinned code,</text><text x='628.0' y='230' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>file:line@commit</text><rect x='272' y='168' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='380.0' y='192' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S4  calibrate + traces</text><text x='380.0' y='212' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>bug fails, fix passes,</text><text x='380.0' y='230' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>real traces replay</text><rect x='24' y='168' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='132.0' y='192' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S5  red team</text><text x='132.0' y='212' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>attack fidelity, strength,</text><text x='132.0' y='230' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>scope extrapolation</text><rect x='24' y='284' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='132.0' y='308' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S6  hunt + fix</text><text x='132.0' y='328' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>counterexamples, fixes</text><text x='132.0' y='346' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>in model and code</text><rect x='272' y='284' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='380.0' y='308' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S7  prove</text><text x='380.0' y='328' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>inductive invariants,</text><text x='380.0' y='346' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>TLAPS</text><rect x='520' y='284' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='628.0' y='308' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S8  package + maintain</text><text x='628.0' y='328' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>regression skill that</text><text x='628.0' y='346' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>reruns as code changes</text><path d='M240 92.0H268' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M488 92.0H516' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M628.0 132V164' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M520 208.0H492' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M272 208.0H244' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M132.0 248V280' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M240 324.0H268' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M488 324.0H516' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/></svg><figcaption>vstack&#x27;s stage skills. Orange: what the LoRA example walked through (S4 without trace replay; no TLAPS proof was run, so S7 is not marked).</figcaption></figure>
 
-<p>Using it looks like this:</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># install from the command line</span>
-git<span class="w"> </span>clone<span class="w"> </span>https://github.com/hao-ai-lab/vstack.git
-<span class="nb">cd</span><span class="w"> </span>vstack<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>uv<span class="w"> </span>tool<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
-vstack<span class="w"> </span>setup<span class="w">    </span><span class="c1"># checks Java/TLC/Z3, installs skills into Claude Code, Codex or Cursor</span>
-
-<span class="c1"># or as a plugin: in Claude Code</span>
-/plugin<span class="w"> </span>marketplace<span class="w"> </span>add<span class="w"> </span>hao-ai-lab/vstack
-/plugin<span class="w"> </span>install<span class="w"> </span>vstack
-<span class="c1"># in Cursor</span>
-/add-plugin<span class="w"> </span>vstack
-
-<span class="c1"># then: one module plus one safety property</span>
-/vstack-mode<span class="w"> </span>verify<span class="w"> </span>that<span class="w"> </span>our<span class="w"> </span>RDMA<span class="w"> </span>KV<span class="w"> </span>cache<span class="w"> </span>lease<span class="w"> </span>manager<span class="w"> </span>never<span class="w"> </span>recycles<span class="w"> </span>an<span class="w"> </span>in-flight<span class="w"> </span>page<span class="w"> </span>on<span class="w"> </span>timeout.
-</code></pre></div>
-
+<p>You point it at one module with one safety property, for example <code>/vstack-mode verify that our RDMA KV cache lease manager never recycles an in-flight page on timeout.</code>, and it walks the agent through the stages.</p>
 <p>Even with vstack, three steps stay with a human: approving the spec, judging whether a counterexample is real and reproducing it on hardware, and reviewing the assumption list at the end.</p>
 <h3 id="does-every-feature-need-its-own-model-do-i-write-the-rules-myself">Does every feature need its own model? Do I write the rules myself?<a class="headerlink" href="#does-every-feature-need-its-own-model-do-i-write-the-rules-myself" title="Link to this section">#</a></h3>
 <p>Both yes. Nobody models a whole engine. Pick a subsystem with a clear boundary and keep only the state the property needs. But draw the boundary where components interact, not along the directory tree: veriserve's ledger covers RDMA transfer, prefix sharing and decode attention in one state machine, because the PD bugs live at their seams.</p>
