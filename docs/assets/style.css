@@ -41,6 +41,13 @@ header.site nav a { margin-left: 18px; color: var(--muted); text-decoration: non
 footer.site { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule); margin-top: 64px; padding-top: 16px; padding-bottom: 40px; }
 footer.site a { color: var(--muted); }
 
+.home { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; }
+.home h1 { font-size: 44px; line-height: 1.15; margin: 0 0 12px; letter-spacing: -0.02em; }
+.home p { font-size: 19px; color: var(--muted); margin: 0 0 8px; }
+.home .links { margin-top: 20px; }
+.home .links a { font-weight: 600; text-decoration: none; }
+.home .links a:hover { text-decoration: underline; }
+
 .intro h1 { font-size: 34px; margin: 40px 0 4px; }
 .intro p { color: var(--muted); margin: 0 0 32px; }
 ul.posts { list-style: none; padding: 0; }

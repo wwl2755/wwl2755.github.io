@@ -17,8 +17,8 @@ from pygments.formatters import HtmlFormatter
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "docs"
-SITE = {"title": "Wenlong's notes", "author": "Wenlong", "url": "https://wwl2755.github.io",
-        "github": "https://github.com/wwl2755"}
+SITE = {"title": "Wenlong", "author": "Wenlong", "url": "https://wwl2755.github.io",
+        "tagline": "I work on LLM inference systems."}
 
 
 def front_matter(text):
@@ -39,7 +39,7 @@ def page(title, body, description="", canonical=""):
     tpl = (ROOT / "templates" / "base.html").read_text()
     return (tpl.replace("{{title}}", escape(title)).replace("{{site_title}}", escape(SITE["title"]))
                .replace("{{description}}", escape(description)).replace("{{canonical}}", canonical)
-               .replace("{{github}}", SITE["github"]).replace("{{year}}", str(date.today().year))
+               .replace("{{year}}", str(date.today().year))
                .replace("{{body}}", body))
 
 
@@ -78,10 +78,15 @@ def build():
     items = "".join(
         f'<li><time datetime="{d}">{d:%b %-d, %Y}</time><a href="{url}">{escape(m["title"])}</a>'
         f'<p>{escape(m.get("description", ""))}</p></li>' for d, m, url in posts)
-    home = (f'<section class="intro"><h1>{escape(SITE["title"])}</h1>'
-            f'<p>Notes on LLM inference systems: serving engines, KV caches, and making them correct.</p></section>'
-            f'<ul class="posts">{items}</ul>')
-    (OUT / "index.html").write_text(page(SITE["title"], home, "Notes on LLM inference systems.", SITE["url"] + "/"))
+    blog = f'<section class="intro"><h1>Blog</h1></section><ul class="posts">{items}</ul>'
+    (OUT / "blog").mkdir()
+    (OUT / "blog" / "index.html").write_text(page(f'Blog · {SITE["title"]}', blog, "Posts by Wenlong.", SITE["url"] + "/blog/"))
+    home = (f'<section class="home"><h1>{escape(SITE["title"])}</h1>'
+            f'<p>{escape(SITE["tagline"])}</p>'
+            f'<p class="links"><a href="/blog/">Blog →</a></p></section>')
+    home_html = re.sub(r'<header class="site">.*?</header>\n|<footer class="site">.*?</footer>\n', "",
+                       page(SITE["title"], home, SITE["tagline"], SITE["url"] + "/"))
+    (OUT / "index.html").write_text(home_html)
     (OUT / "404.html").write_text(page("Not found", '<h1>Not found</h1><p><a href="/">Back to the home page</a></p>'))
     print("built", len(posts), "post(s) into", OUT)
 
