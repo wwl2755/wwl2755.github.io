@@ -171,7 +171,8 @@ def pd_fix():
     b.append(t(355, 222, "its request has already failed", 12, "middle", color="var(--muted)", italic=True))
     b.append(node(536, 82, 200, 56, "FREE", ["ACK: the write has stopped"], "var(--good)", 1.8))
     b.append(node(536, 202, 200, 56, "QUARANTINED", ["no proof: never reused"], "var(--bad)", 1.8))
-    b.append(t(230, 162, "release", 12, "middle", color="var(--muted)"))
+    b.append(t(230, 152, "release or", 12, "middle", color="var(--muted)"))
+    b.append(t(230, 164, "timeout", 12, "middle", color="var(--muted)"))
     b.append(t(506, 102, "ACK", 12, "middle", color="var(--muted)"))
     b.append(t(506, 248, "no ACK", 12, "middle", color="var(--muted)"))
     return svg(n, 760, 278, "PdLedger page states after a release or timeout", "".join(b))
@@ -200,7 +201,7 @@ def lora_trace():
     cache = [1, 1, 2, None, 1, 1, 1]
     x0, dx = 120, 96
     Y = {2: 90, 1: 170, None: 230}
-    b = [t(24, 30, "TLC's counterexample: the worker cache falls behind the front end at step 5", 15, weight=600)]
+    b = [t(24, 30, "TLC's counterexample: the worker cache falls behind the front end at state 5", 15, weight=600)]
     for v, lab in ((2, "v2"), (1, "v1"), (None, "not cached")):
         b.append(f"<line x1='{x0 - 20}' y1='{Y[v]}' x2='{x0 + dx * 6 + 20}' y2='{Y[v]}' stroke='var(--line)' stroke-opacity='0.35'/>")
         b.append(t(x0 - 30, Y[v] + 4, lab, 12.5, "end", color="var(--muted)"))
@@ -214,7 +215,7 @@ def lora_trace():
         b.append(t(x0 + i * dx, 262, f"{i + 1}", 12, "middle", 600, "var(--muted)"))
         b.append(t(x0 + i * dx, 280, s, 12.5, "middle"))
     b.append(f"<circle cx='{x0 + 6 * dx}' cy='{Y[1] + 4}' r='9' fill='none' stroke='var(--bad)' stroke-width='2'/>")
-    b.append(t(x0 + 4 * dx, Y[1] - 16, "cache regresses to v1", 12.5, "middle", 600, "var(--accent)"))
+    b.append(t(x0 + 4 * dx, Y[1] - 16, "cache holds v1, front end says v2", 12.5, "middle", 600, "var(--accent)"))
     b.append(t(x0 + 6 * dx + 16, Y[1] + 32, "r2 carries v2, runs v1", 12.5, "end", 600, "var(--bad)"))
     b.append(f"<line x1='{x0}' y1='306' x2='{x0 + 30}' y2='306' stroke='var(--accent2)' stroke-width='2.4'/>")
     b.append(t(x0 + 38, 310, "registered version (front end)", 12.5, color="var(--fg)"))
@@ -234,9 +235,9 @@ def vstack_stages():
               ("S6", "hunt + fix", ["counterexamples, fixes", "in model and code"]),
               ("S7", "prove", ["inductive invariants,", "TLAPS"]),
               ("S8", "package + maintain", ["regression skill that", "reruns as code changes"])]
-    used = {"S2", "S3", "S4", "S6", "S7"}
+    used = {"S2", "S3", "S4", "S6"}
     W, H, gx, gy = 216, 80, 32, 36
-    b = [t(24, 30, "vstack's nine stages (orange: the ones the LoRA example walked through)", 15, weight=600)]
+    b = [t(24, 30, "vstack's nine stages (orange: what the LoRA example walked through)", 15, weight=600)]
     pos = {}
     for i, (sid, name, lines) in enumerate(stages):
         r, c = divmod(i, 3)
@@ -346,10 +347,11 @@ def induction():
     b.append(t(ux, uy - 14, "u", 13, "middle", 600, "var(--bad)"))
     b.append(path(n, f"M{ux + 6} {uy + 6}L{ux + 100} {uy + 80}", "bad", 1.8))
     b.append(f"<circle cx='{ux + 104}' cy='{uy + 83}' r='6' fill='none' stroke='var(--bad)' stroke-width='1.6'/>")
-    b.append(t(520, 110, "u: an unreachable state in P", 12.5, weight=600, color="var(--bad)"))
-    b.append(t(520, 128, "where lock_ref is already wrong.", 12.5, color="var(--muted)"))
-    b.append(t(520, 146, "One unlock steps out of P, so", 12.5, color="var(--muted)"))
-    b.append(t(520, 164, "the induction step fails for P.", 12.5, color="var(--muted)"))
+    b.append(t(520, 96, "u: unreachable, but inside P:", 12.5, weight=600, color="var(--bad)"))
+    b.append(t(520, 114, "lock_ref = 1, two requests", 12.5, color="var(--muted)"))
+    b.append(t(520, 132, "use the node. One finishes,", 12.5, color="var(--muted)"))
+    b.append(t(520, 150, "lock_ref drops to 0, and the", 12.5, color="var(--muted)"))
+    b.append(t(520, 168, "node is evicted while in use.", 12.5, color="var(--muted)"))
     return svg(n, 760, 316, "A non-inductive property versus a strengthened inductive invariant", "".join(b))
 
 

@@ -57,6 +57,8 @@ A PD deployment has at least the scheduler, the Prefill worker, the Decode worke
 
 Formal verification means treating the program as a mathematical object, writing "correct" as a precise proposition, and proving it. The whole field fits in one line: **M ⊨ P**, "model M satisfies property P". Testing checks examples; verification checks a universal claim: for all inputs and **all schedules**, the program satisfies P.
 
+The tools that come up below are **TLA+**, a language for writing a system down as a state machine; **TLC**, the model checker that explores a TLA+ model's states; **TLAPS**, the proof checker for TLA+; and **Z3**, an SMT solver that answers questions about arithmetic.
+
 {{fig:m-p-check|The three parts of every formal check: a model, a property, and a checker that either confirms it or hands back a counterexample.}}
 
 ### The model is a state machine
@@ -83,7 +85,7 @@ One run of the system is a sequence of states s0 → s1 → s2 …, called a beh
 
 At every step, any action whose precondition holds may be the next one. You do not simulate the network, the thread scheduler or the NIC. You only say "the RDMA completion OR the timeout OR a new request may happen next", and the checker tries every branch. Everything you cannot control becomes a choice, and the property must hold on every branch.
 
-{{fig:nondeterminism|Each enabled action is a branch. A test follows one; TLC enumerates them all.}}
+{{fig:nondeterminism|Each enabled action is a branch. A test follows one; a model checker such as TLC enumerates them all.}}
 
 ### Safety and liveness
 
@@ -99,9 +101,9 @@ Liveness usually needs fairness assumptions ("if the RDMA completion keeps being
 
 ### Proofs rest on inductive invariants
 
-To prove Inv holds in every reachable state you need two facts: **Init ⇒ Inv**, and **Inv ∧ Next ⇒ Inv′** (any step from a state satisfying Inv keeps it). It is the same idea as a loop invariant.
+To prove a property Inv holds in every reachable state you need two facts: **Init ⇒ Inv** (every start state satisfies Inv) and **Inv ∧ Next ⇒ Inv′** (if Inv holds and any one enabled action runs, Inv still holds afterwards). Here ⇒ means "implies", ∧ means "and", Init describes the start states, Next means "any one enabled action", and the prime in Inv′ means "evaluated on the state after the step". It is the same idea as a loop invariant: true on entry, preserved by every iteration.
 
-The catch: the property you care about is rarely inductive on its own. "A node with lock_ref > 0 is never evicted" fails the induction step, because it allows states where lock_ref no longer matches the real number of users. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.
+The catch: the property you care about is rarely inductive on its own. Take P = "a prefix-cache node with lock_ref > 0 is never evicted". P also holds in an odd state that the real system never reaches: lock_ref = 1 while two running requests use the node. From there, one request finishes and unlocks, lock_ref drops to 0, eviction becomes legal, and a node that is still in use gets evicted. So "P before the step" does not guarantee "P after the step", and the induction fails. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.
 
 {{fig:induction|P alone admits unreachable states like u from which one step breaks P. The strengthened Inv excludes them, so every step from Inv stays in Inv.}}
 
@@ -109,7 +111,7 @@ The catch: the property you care about is rarely inductive on its own. "A node w
 
 | | Model checking | SMT solving | Theorem proving |
 | --- | --- | --- | --- |
-| Tools | TLC, Apalache | Z3, cvc5 | TLAPS, Lean, Coq, Dafny, Verus |
+| Tools | TLC, Apalache | Z3 | TLAPS, Lean, Dafny |
 | How | Enumerate every reachable state | Encode the question as a formula: "is there a solution?" | Write a proof, usually by induction |
 | Automation | Full | Mostly | Needs a human or an AI |
 | Any scale | No, bounded | Bounded, or within a theory | Yes |
@@ -148,12 +150,12 @@ With safety and liveness in hand, the PD bug looks different. Decode has two opt
 
 | Option | Keeps | Breaks |
 | --- | --- | --- |
-| Free the pages on timeout | Liveness: requests never hang, pages are always reclaimed | Isolation (safety): a late write lands in a new request's pages |
-| Wait for the done notice | Isolation: pages are never reused while a write may land | Finality (liveness): a lost notice hangs the request and its pages forever |
+| Free the pages on timeout | Liveness: requests never hang, pages are always reclaimed | Isolation, a safety property (data never crosses requests): a late write lands in a new request's pages |
+| Wait for the done notice | Isolation: pages are never reused while a write may land | Finality, a liveness property (everything eventually finishes): a lost notice hangs the request and its pages forever |
 
-The blog proves this is not a tuning problem: under unbounded asynchronous delay, where local histories are indistinguishable, no local-only page reclamation policy can guarantee both. veriserve's way out is to separate what happens to the **request** from what happens to its **pages**:
+The blog proves this is not a tuning problem. When delays have no upper bound, a slow write and a dead peer look exactly the same from Decode's side, so no rule based only on what Decode can see can guarantee both. veriserve's way out is to separate what happens to the **request** from what happens to its **pages**:
 
-{{fig:pd-fix|PdLedger page states on a release or timeout. Simplified: the ledger tracks six states in all, adding SHARED and DUP for prefix sharing.}}
+{{fig:pd-fix|PdLedger page states when a request ends or times out. Simplified: the ledger tracks six states in all, adding SHARED and DUP for prefix sharing.}}
 
 On a timeout the request fails and returns at once, so it never hangs. Its pages go to DRAINING, not FREE, and Decode sends an ABORT asking Prefill whether the write has stopped.
 
@@ -186,6 +188,36 @@ The bug, in five events:
 
 The victim (r2) is not the culprit (r1), which is why per-request assertions miss it. The bug also needs more adapters than `max_cpu_loras`; single-adapter setups are unaffected.
 
+### Reading the TLA+ below
+
+TLA+ describes the same kind of state machine as the Python sketch earlier. The model's state is seven variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `reg` | the version of adapter A the front end currently points to (1, 2, …) |
+| `cacheA` | the version of A in the worker's CPU cache, 0 if not cached |
+| `cacheB` | whether adapter B is in the cache (capacity is 1, so A and B evict each other) |
+| `inplaceSrc` | the latest hot-reload version the worker remembers (used only by the fixed code), 0 if none |
+| `status[r]` | request r's state: `"idle"`, `"queued"` or `"done"` |
+| `snap[r]` | the version request r carried when it was admitted |
+| `used[r]` | the version request r actually ran on |
+
+The syntax you need:
+
+| TLA+ | Meaning |
+| --- | --- |
+| `X == …` | define X |
+| `/\`  `\/` | and, or (a list of `/\` lines must all hold) |
+| `\A r \in S : …` | for every r in S |
+| `=>`  `#` | implies, not equal |
+| `x'` | the value of x after this step |
+| `[f EXCEPT ![r] = v]` | f with only entry r changed to v |
+| `UNCHANGED <<x, y>>` | x and y keep their values this step |
+| `LET … IN …` | local definitions |
+| `\*` | comment |
+
+An action such as `Run(r)` is a list of conditions on the state before (unprimed) and after (primed) one step. The step can happen only when all of them can be true.
+
 ### Step 1: the spec is a design decision
 
 The obvious spec, "every request runs the version it was admitted with", is wrong: the upstream fix runs r1 on v2 too, which is what a hot reload should mean. The policy I chose is that old requests may run on newer weights, but new requests must never run on older ones:
@@ -194,13 +226,27 @@ The obvious spec, "every request runs the version it was admitted with", is wron
 NoStaleWeights == \A r \in Reqs : status[r] = "done" => used[r] >= snap[r]
 ```
 
+In words: for every request, once it is done, the version it ran on is at least the version it was admitted with.
+
 ### Step 2: abstract
 
 Paths become version numbers. The cache gets capacity 1 with only adapters A and B, which is enough to evict A. All of B's traffic collapses into one action, `UseB`. Tensors, GPU slots and tensor parallelism are dropped. One simplification is recorded as an assumption: the hot reload is modeled as a single atomic step. The model has 7 variables and 4 actions (`Admit`, `Reload`, `UseB`, `Run`), each mapped back to a code location.
 
 ### Step 3: model
 
-The key action is a direct translation of `add_adapter`. A constant `FIX` lets one model describe the code before and after the patch:
+The upstream fix makes the worker remember the latest hot-reload source for each adapter id and load from it on a cache miss. A constant `FIX` lets one model describe the code before (`FALSE`) and after (`TRUE`) the patch. `Reload` is where the fix records the source:
+
+```tla
+Reload ==
+  /\ reg < MaxVer                      \* MaxVer bounds the number of versions
+  /\ reg' = reg + 1
+  /\ cacheA' = reg + 1                 \* the worker reloads A right away
+  /\ cacheB' = FALSE                   \* capacity 1: loading A evicts B
+  /\ inplaceSrc' = IF FIX THEN reg + 1 ELSE inplaceSrc
+  /\ UNCHANGED <<status, snap, used>>
+```
+
+The key action, `Run`, is a direct translation of `add_adapter`:
 
 ```tla
 Run(r) ==
@@ -211,7 +257,7 @@ Run(r) ==
          ver == IF cacheA = 0 THEN loadVer   \* miss: load
                               ELSE cacheA    \* hit: reuse
      IN /\ cacheA' = ver
-        /\ cacheB' = IF cacheA = 0 THEN FALSE ELSE cacheB
+        /\ cacheB' = IF cacheA = 0 THEN FALSE ELSE cacheB  \* a load evicts B
         /\ used' = [used EXCEPT ![r] = ver]
   /\ status' = [status EXCEPT ![r] = "done"]
   /\ UNCHANGED <<reg, inplaceSrc, snap>>
@@ -223,11 +269,11 @@ Run(r) ==
 java -cp tla2tools.jar tlc2.TLC -deadlock -config bug.cfg LoraReload
 ```
 
-With 2 requests and 2 versions, TLC finds the violation in under a second and prints the five-event story above as a 7-state trace, the shortest one possible:
+`bug.cfg` sets 2 requests, 2 versions and `FIX = FALSE`. TLC finds the violation in under a second and prints the five events above as a trace of 7 states (the start state plus 6 steps; admitting r2 is its own step), the shortest one possible:
 
-{{fig:lora-trace|TLC's 7-state counterexample, plotted. The cache (orange) falls below the registered version (blue) at step 5; step 7 violates NoStaleWeights.}}
+{{fig:lora-trace|TLC's 7-state counterexample, plotted (numbers are states, not the five events above). At state 5 the cache holds v1 while the front end says v2; at state 7 r2 runs on v1 and NoStaleWeights fails.}}
 
-Then the fix: the worker remembers the latest in-place source for each adapter id and loads from it on a miss.
+With `FIX = TRUE` the violation disappears. "Distinct states" is the number of different states TLC reached and checked:
 
 | Config | Distinct states | Result |
 | --- | --- | --- |
@@ -235,14 +281,14 @@ Then the fix: the worker remembers the latest in-place source for each adapter i
 | Fixed code, 2 requests, 2 versions | 90 | Passes |
 | Fixed code, 3 requests, 3 versions | 2,486 | Passes |
 
-A beginner trap: the first run of the fixed model reported "Deadlock reached". Once every request is done the model has nothing left to do, which TLC treats as deadlock by default. Here that is normal termination, so run with `-deadlock`.
+A beginner trap: the first run of the fixed model reported "Deadlock reached". Once every request is done the model has nothing left to do, which TLC treats as deadlock by default. Here that is normal termination, so pass `-deadlock`, which tells TLC not to report it.
 
 ### Step 5: check that the model is not lying
 
 A property passes either because it is true, or because the bad state is unreachable in your model. Three checks separate the two:
 
 - **The historical bug must fail** on the original model. It does.
-- **Mutation:** delete the line in `Reload` that records the new source. The fixed model fails again, so that line is load-bearing.
+- **Mutation:** delete the `inplaceSrc'` line from `Reload` (the line that records the new source). The fixed model fails again, so that line is load-bearing.
 - **Reachability witness:** assert something that *should* be violated ("no request admitted after a reload ever finishes"). TLC breaks it at the 4th state, so the interesting path is reachable.
 
 ### Step 6: from bounded to any scale
@@ -256,7 +302,9 @@ FreshCache ==
   /\ \A r \in Reqs : snap[r] <= reg   \* no request holds a future version
 ```
 
-TLC confirms it on the fixed model at 3 requests and 3 versions; on the original model it fails right after the first reload. Its first line states the bug in one sentence: the worker cache must never be older than the front end. Proving it inductive with TLAPS would extend the result to any number of requests and versions.
+This is the strengthening from the induction section. The first line is the real point and states the bug in one sentence: the worker cache must never be older than the front end. The other two lines are what make it inductive: line 2 says the source a cache miss would load from is always the newest, and line 3 rules out impossible states where a request holds a version from the future. On the original model the second line fails right after the first reload, because the old code never records a source; the first line fails at state 5.
+
+TLC confirms FreshCache holds in every reachable state of the fixed model with 3 requests and 3 versions. That alone is not a proof that it is inductive. Proving that with TLAPS would extend the result to any number of requests and versions.
 
 ### What this does not prove
 
@@ -275,12 +323,12 @@ The new failure mode is **reward hacking**. In the blog's words, when a checker 
 | Role isolation | Coordinator, worker and red-team agents are kept separate | I reviewed the spec and the results myself |
 | Hash-pinned specs | SHA-256 locks the approved safety properties, so they cannot be quietly weakened | NoStaleWeights never changed after step 1 |
 | Line-anchored models | Every state variable and action maps to `file:line@commit` | The variable-to-code mapping in step 2 |
-| Mutation and trace gates | The old bug must fail, the fix must pass, removing a guard must fail again, real traces must replay | Step 5 (without trace replay) |
+| Mutation and trace gates | The old bug must fail, the fix must pass, removing a guard must fail again, and logs from real runs must replay as valid model behaviors | Step 5 (without trace replay) |
 | Proof and runtime checks | TLAPS proofs for critical state machines, with preconditions mirrored as runtime checks | FreshCache in step 6 |
 
 The blog summarizes the workflow as five steps (specification, abstraction, validation, verification, continuous checking). The repo splits it into nine stage skills:
 
-{{fig:vstack-stages|vstack's stage skills, S0 to S8.}}
+{{fig:vstack-stages|vstack's stage skills. Orange: what the LoRA example walked through (S4 without trace replay; no TLAPS proof was run, so S7 is not marked).}}
 
 Using it looks like this:
 
