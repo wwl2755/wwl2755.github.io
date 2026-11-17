@@ -4,13 +4,13 @@ date: 2026-11-16
 description: Learning notes on formal verification for LLM inference, from a silent PD-disaggregation bug to an 80-line TLA+ model of a real vLLM bug.
 ---
 
-Recent LMSYS and Cloudflare disclosures, cited in Hao AI Lab's [Towards Verifiable LLM Infra](https://haoailab.com/blogs/verifiable-llm-infra/), describe silent failures in prefill-decode (PD) disaggregated serving, including a rejected-request KV handoff bug that exposed data across 155 user responses.
+In October 2026, [Cloudflare disclosed](https://blog.cloudflare.com/kv-cache-exposure-remediation/) that its GLM-5.3 model on Workers AI had returned 155 responses containing data from other customers' requests. The cause combined a configuration mismatch with an SGLang bug in prefill-decode (PD) disaggregated mode: a request that should have been rejected as too long reported itself as live, and the decode node then generated a response while attending over stale KV cache pages from earlier requests ([SGLang issue #30233](https://github.com/sgl-project/sglang/issues/30233)). The clients got HTTP 200, not an error. SGLang's maintainers published a matching [security update on request isolation](https://www.lmsys.org/blog/2026-10-26-cf-security/).
 
-This post is my learning notes from that blog and its two repos, [vstack](https://github.com/hao-ai-lab/vstack) and [veriserve](https://github.com/hao-ai-lab/veriserve).
+Hao AI Lab's [Towards Verifiable LLM Infra](https://haoailab.com/blogs/verifiable-llm-infra/) cites these disclosures as evidence of the production risk that motivates its work on formal verification. This post is my learning notes from that blog and its two repos, [vstack](https://github.com/hao-ai-lab/vstack) and [veriserve](https://github.com/hao-ai-lab/veriserve).
 
 ## How a late KV write leaks data
 
-One failure of this kind, which veriserve studies in depth: a Decode instance times out waiting for a request's KV cache, frees that request's KV pages, and hands them to a new request. Meanwhile the Prefill instance's RDMA write for the old request is still queued on the NIC, and it lands in the new request's pages. Nothing crashes and no error is logged. The new user just gets an answer polluted by another user's context.
+A closely related PD failure, which veriserve studies in depth, needs no misconfiguration at all: a Decode instance times out waiting for a request's KV cache, frees that request's KV pages, and hands them to a new request. Meanwhile the Prefill instance's RDMA write for the old request is still queued on the NIC, and it lands in the new request's pages. Nothing crashes and no error is logged. The new user just gets an answer polluted by another user's context.
 
 ### How the KV gets there
 
@@ -26,7 +26,7 @@ Taking SGLang with a push-style transfer backend (Mooncake) as the example, one 
 Three properties of one-sided RDMA make this fragile:
 
 - **One-sided:** Decode's CPU is not involved and cannot see when the write happens.
-- **Not cancellable:** in the blog's words, one-sided transfers already queued on the NIC "cannot be canceled in hardware on the studied transport paths".
+- **Not cancellable:** in [Hao AI Lab's](https://haoailab.com/blogs/verifiable-llm-infra/) words, one-sided transfers already queued on the NIC "cannot be canceled in hardware on the studied transport paths".
 - **Notice-only:** the only way Decode learns the write finished is a message from Prefill.
 
 ### How it goes wrong
@@ -103,7 +103,7 @@ Liveness usually needs fairness assumptions ("if the RDMA completion keeps being
 
 To prove a property Inv holds in every reachable state you need two facts: **Init ⇒ Inv** (every start state satisfies Inv) and **Inv ∧ Next ⇒ Inv′** (if Inv holds and any one enabled action runs, Inv still holds afterwards). Here ⇒ means "implies", ∧ means "and", Init describes the start states, Next means "any one enabled action", and the prime in Inv′ means "evaluated on the state after the step". It is the same idea as a loop invariant: true on entry, preserved by every iteration.
 
-The catch: the property you care about is rarely inductive on its own. Take P = "a prefix-cache node that a running request still uses is never evicted", where the eviction code only evicts nodes with lock_ref = 0. P also holds in an odd state that the real system never reaches: lock_ref = 0 while a running request still uses the node (the count is too low). From that state a single eviction step is legal and evicts a node in use. So "P before the step" does not guarantee "P after the step", and the induction fails. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.
+The catch: the property you care about is rarely inductive on its own. Take P = "a prefix-cache node that a running request still uses is never evicted", where the eviction code only evicts nodes with lock_ref = 0. P also holds in an odd state that the real system never reaches: lock_ref = 0 while a running request still uses the node (the count is too low). From that state a single eviction step is legal and evicts a node in use. So "P before the step" does not guarantee "P after the step", and the induction fails. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed [54 inductive invariants across 64 protocol actions](https://github.com/hao-ai-lab/veriserve#readme).
 
 {{fig:induction|P alone admits unreachable states like u from which one step breaks P. The strengthened Inv excludes them, so every step from Inv stays in Inv.}}
 
@@ -153,7 +153,7 @@ With safety and liveness in hand, the PD bug looks different. Decode has two opt
 | Free the pages on timeout | Liveness: requests never hang, pages are always reclaimed | Isolation, a safety property (data never crosses requests): a late write lands in a new request's pages |
 | Wait for the done notice | Isolation: pages are never reused while a write may land | Finality, a liveness property (everything eventually finishes): a lost notice hangs the request and its pages forever |
 
-The blog proves this is not a tuning problem. When delays have no upper bound, a slow write and a dead peer look exactly the same from Decode's side, so no rule based only on what Decode can see can guarantee both. veriserve's way out is to separate what happens to the **request** from what happens to its **pages**:
+[Hao AI Lab's blog](https://haoailab.com/blogs/verifiable-llm-infra/) proves this is not a tuning problem. When delays have no upper bound, a slow write and a dead peer look exactly the same from Decode's side, so no rule based only on what Decode can see can guarantee both. veriserve's way out is to separate what happens to the **request** from what happens to its **pages**:
 
 {{fig:pd-fix|PdLedger page states when a request ends or times out. Simplified: the ledger tracks six states in all, adding SHARED and DUP for prefix sharing.}}
 
@@ -164,13 +164,13 @@ On a timeout the request fails and returns at once, so it never hangs. Its pages
 - **Generations reject stale messages:** every page carries a (page, gen) ticket and transfer ids are never reused. A done notice or ACK that does not match the peer, room, generation and transfer id is dropped. This closes a second bug family, where a message from an old session is taken for the current one.
 - **Prefill reports done only when it is true:** the done notice goes out after every block has completed locally, not when the write is posted, because a notice sent at submission can overtake the data.
 
-The cost is a few pages lost for good when something goes wrong. Across six paired runs against an unverified bypass baseline, the blog measures PdLedger at +0.18% mean p50 TPOT (95% CI −0.32% to +0.68%). Note what is proven: the TLAPS proof covers safety only. Finality, the request failing fast instead of hanging, is runtime behavior outside the proof.
+The cost is a few pages lost for good when something goes wrong. Across six paired runs against an unverified bypass baseline, [the blog](https://haoailab.com/blogs/verifiable-llm-infra/) measures PdLedger at +0.18% mean p50 TPOT (95% CI −0.32% to +0.68%). Note what is proven: the TLAPS proof covers safety only. Finality, the request failing fast instead of hanging, is runtime behavior outside the proof.
 
-Upstream, veriserve's case studies split the SGLang issues in two. Room-reuse identity confusion has five local fix PRs, all open and unmerged when the case studies were checked on 2026-11-08 (they apply the generation idea above). Treating a timeout or an error as "the remote side has stopped" is filed as architectural, with no local PR, because no local patch escapes the dilemma; it needs a page state machine like this one.
+Upstream, [veriserve's case studies](https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies) split the SGLang issues in two. Room-reuse identity confusion has five local fix PRs ([#48883](https://github.com/sgl-project/sglang/pull/48883), [#48889](https://github.com/sgl-project/sglang/pull/48889), [#48960](https://github.com/sgl-project/sglang/pull/48960), [#48979](https://github.com/sgl-project/sglang/pull/48979), [#48982](https://github.com/sgl-project/sglang/pull/48982)), all open and unmerged when the case studies were checked on 2026-11-08 (they apply the generation idea above). Treating a timeout or an error as "the remote side has stopped" is filed as architectural, with no local PR, because no local patch escapes the dilemma; it needs a page state machine like this one.
 
 ## A worked example: an 80-line model of a real vLLM bug
 
-To learn the workflow end to end, I modeled one bug from vstack's list: after a LoRA hot reload, new requests can silently run on old weights ([vLLM PR #67459](https://github.com/vllm-project/vllm/pull/67459)). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. Every TLC result quoted here is a real run. Files: [LoraReload.tla](/assets/models/LoraReload.tla), [bug.cfg](/assets/models/bug.cfg), [fix.cfg](/assets/models/fix.cfg), [reach.cfg](/assets/models/reach.cfg).
+To learn the workflow end to end, I modeled one bug from vstack's [verified bug list](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0): after a LoRA hot reload, new requests can silently run on old weights ([vLLM PR #67459](https://github.com/vllm-project/vllm/pull/67459)). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. Every TLC result quoted here is a real run. Files: [LoraReload.tla](/assets/models/LoraReload.tla), [bug.cfg](/assets/models/bug.cfg), [fix.cfg](/assets/models/fix.cfg), [reach.cfg](/assets/models/reach.cfg).
 
 ### The setup
 
@@ -308,13 +308,13 @@ TLC confirms FreshCache holds in every reachable state of the fixed model with 3
 
 ### What this does not prove
 
-The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. vstack's bug list also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting `Reload` into two actions is a good exercise.
+The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. [vstack's entry for this bug](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0) also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting `Reload` into two actions is a good exercise.
 
 ## Why now: AI writes the specs, vstack keeps it honest
 
 Formal methods are decades old. What changed is cost. Hand-written specs and proofs took months, while vLLM and SGLang merge new code every day. LLMs can now read a large codebase and produce specs and proofs quickly. Proof checkers are strict, so a fake proof is rejected: the failure mode is "could not prove it", not "hallucinated a proof".
 
-The new failure mode is **reward hacking**. In the blog's words, when a checker finds a race, a naive coding agent "weakens the invariant, deletes the timeout branch from the model" instead of surfacing the real bug, until the checker says 0 errors.
+The new failure mode is **reward hacking**. In [Hao AI Lab's](https://haoailab.com/blogs/verifiable-llm-infra/) words, when a checker finds a race, a naive coding agent "weakens the invariant, deletes the timeout branch from the model" instead of surfacing the real bug, until the checker says 0 errors.
 
 [vstack](https://github.com/hao-ai-lab/vstack) is a plugin for Claude Code, Codex and Cursor built to block this. It adds no new solver; it uses TLC, Apalache, TLAPS and Z3. It forces the agent through gates:
 
@@ -354,7 +354,7 @@ Even with vstack, three steps stay with a human: approving the spec, judging whe
 
 Both yes. Nobody models a whole engine. Pick a subsystem with a clear boundary and keep only the state the property needs. But draw the boundary where components interact, not along the directory tree: veriserve's ledger covers RDMA transfer, prefix sharing and decode attention in one state machine, because the PD bugs live at their seams.
 
-Defining the rules is the step least safe to hand to an AI. You do not start from zero, though. Most bugs in vstack's list fall into five classes (the list also uses Progress and Invariance for a few):
+Defining the rules is the step least safe to hand to an AI. You do not start from zero, though. Most bugs in [vstack's list](https://github.com/hao-ai-lab/vstack/blob/main/bugs/verified-bugs.csv) fall into five classes (the list also uses Progress and Invariance for a few):
 
 | Class | Meaning | Example | Ask of a new feature |
 | --- | --- | --- | --- |
@@ -381,13 +381,13 @@ Follow a request through an inference engine and almost every stop has a propert
 | Parallel collectives | All ranks issue collectives in the same order; all-to-all is a permutation | TLA+, Z3 |
 | Kernel indexing | Block tables and mask bounds never go out of range | Z3 |
 
-These are not hypothetical. From vstack's verified bug list:
+These are not hypothetical. From vstack's verified bug list ([SGLang](https://github.com/hao-ai-lab/vstack/blob/main/bugs/verified-bugs.csv), [vLLM](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0)), each linked to its upstream fix or report:
 
-- **SGLang, PD:** a reopened bootstrap room reset the in-flight RDMA counter, causing an early abort ACK and cross-request KV overwrite (68/68 reproductions on GB200).
-- **SGLang, multi-rank scheduler:** with DP attention and the prefill delayer, DP ranks decided locally whether to defer prefill and entered different collectives; the server aborted.
-- **SGLang, DP attention abort path:** an abort and its request reach the owning rank over two unordered channels; an abort that arrived first was dropped, and 19 of 200 requests ran on.
-- **SGLang, CUDA graph padding:** padded rows wrote into reserved slot 0 and produced NaN logits.
-- **vLLM, multimodal KV keys:** with prefix caching and the multimodal processor cache disabled, media items got per-process counter ids instead of content hashes, so an external KV store shared across processes answered a blue image with an earlier red image's content.
+- **SGLang, PD:** a reopened bootstrap room reset the in-flight RDMA counter, causing an early abort ACK and cross-request KV overwrite (68/68 reproductions on GB200; [PR #48889](https://github.com/sgl-project/sglang/pull/48889)).
+- **SGLang, multi-rank scheduler:** with DP attention and the prefill delayer, DP ranks decided locally whether to defer prefill and entered different collectives; the server aborted ([issue #50136](https://github.com/sgl-project/sglang/issues/50136), [PR #50146](https://github.com/sgl-project/sglang/pull/50146)).
+- **SGLang, DP attention abort path:** an abort and its request reach the owning rank over two unordered channels; an abort that arrived first was dropped, and 19 of 200 requests ran on ([issue #50137](https://github.com/sgl-project/sglang/issues/50137), [PR #50147](https://github.com/sgl-project/sglang/pull/50147)).
+- **SGLang, CUDA graph padding:** padded rows wrote into reserved slot 0 and produced NaN logits ([PR #47013](https://github.com/sgl-project/sglang/pull/47013)).
+- **vLLM, multimodal KV keys:** with prefix caching and the multimodal processor cache disabled, media items got per-process counter ids instead of content hashes, so an external KV store shared across processes answered a blue image with an earlier red image's content ([PR #67461](https://github.com/vllm-project/vllm/pull/67461)).
 
 It is a poor fit for some things. Performance (latency, throughput) is out of scope. Floating point is hard: addition is not associative, so "bit-identical to the reference kernel" is often false by design, and proving error bounds is expensive. Anything without a precise definition, such as output quality, cannot be specified. And Python plus CUDA cannot be verified directly today, so the realistic setup is a design-level model plus runtime checks and trace replay to keep it honest.
 
@@ -403,8 +403,10 @@ Formal verification can largely handle the bugs testing is worst at: interleavin
 
 ## Sources
 
+- Cloudflare, [Cross-request KV cache exposure in the GLM-5.3 Workers AI model, and our remediation with SGLang](https://blog.cloudflare.com/kv-cache-exposure-remediation/)
+- LMSYS, [SGLang security update: improving request isolation](https://www.lmsys.org/blog/2026-10-26-cf-security/)
 - Hao AI Lab, [Towards Verifiable LLM Infra](https://haoailab.com/blogs/verifiable-llm-infra/)
-- [vstack](https://github.com/hao-ai-lab/vstack): the agent workflow and the verified bug list ([bugs/verified-bugs.csv](https://github.com/hao-ai-lab/vstack/blob/main/bugs/verified-bugs.csv))
+- [vstack](https://github.com/hao-ai-lab/vstack): the agent workflow and the verified bug lists ([SGLang, bugs/verified-bugs.csv](https://github.com/hao-ai-lab/vstack/blob/main/bugs/verified-bugs.csv); [vLLM, Verified AI Infra Bugs sheet](https://docs.google.com/spreadsheets/d/1LSjmF0IlTFFDbeRYxs6vuNX2IQwLRkXLokIzgq2CyRc/edit?gid=0#gid=0))
 - [veriserve](https://github.com/hao-ai-lab/veriserve): PdLedger, its TLA+/TLAPS/Z3 models and the [PD case studies](https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies)
 - [vLLM PR #67459](https://github.com/vllm-project/vllm/pull/67459): the LoRA hot-reload fix
 - My model and config files: [LoraReload.tla](/assets/models/LoraReload.tla), [bug.cfg](/assets/models/bug.cfg), [fix.cfg](/assets/models/fix.cfg), [reach.cfg](/assets/models/reach.cfg), [kv_address.py](/assets/models/kv_address.py)
