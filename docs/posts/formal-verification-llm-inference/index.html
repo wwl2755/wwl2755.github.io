@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What I Learned About Formal Verification for LLM Inference</title>
+<meta name="description" content="Learning notes on formal verification for inference engineers, from a silent PD-disaggregation bug to an 80-line TLA+ model of a real vLLM bug.">
+<meta property="og:title" content="What I Learned About Formal Verification for LLM Inference">
+<meta property="og:description" content="Learning notes on formal verification for inference engineers, from a silent PD-disaggregation bug to an 80-line TLA+ model of a real vLLM bug.">
+<meta property="og:type" content="article">
+<link rel="canonical" href="https://wwl2755.github.io/posts/formal-verification-llm-inference/">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<header class="site"><a class="brand" href="/">Wenlong&#x27;s notes</a><nav><a href="/">Posts</a><a href="https://github.com/wwl2755">GitHub</a></nav></header>
+<main>
+<article class="post"><header><p class="meta"><time datetime="2026-11-16">November 16, 2026</time></p><h1>What I Learned About Formal Verification for LLM Inference</h1></header><nav class="toc" aria-label="Contents"><details><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#the-bug-that-made-me-care">The bug that made me care</a><ul>
+<li><a href="#how-the-kv-gets-there">How the KV gets there</a></li>
+<li><a href="#how-it-goes-wrong">How it goes wrong</a></li>
+<li><a href="#why-testing-misses-it">Why testing misses it</a></li>
+</ul>
+</li>
+<li><a href="#formal-verification-in-one-page">Formal verification in one page</a><ul>
+<li><a href="#the-model-is-a-state-machine">The model is a state machine</a></li>
+<li><a href="#nondeterminism-is-the-key-trick">Nondeterminism is the key trick</a></li>
+<li><a href="#safety-and-liveness">Safety and liveness</a></li>
+<li><a href="#proofs-rest-on-inductive-invariants">Proofs rest on inductive invariants</a></li>
+<li><a href="#three-families-of-tools-used-together">Three families of tools, used together</a></li>
+<li><a href="#reading-verified-correctly">Reading "verified" correctly</a></li>
+</ul>
+</li>
+<li><a href="#the-pd-bug-is-a-dilemma-not-a-bad-timeout-value">The PD bug is a dilemma, not a bad timeout value</a></li>
+<li><a href="#a-worked-example-an-80-line-model-of-a-real-vllm-bug">A worked example: an 80-line model of a real vLLM bug</a><ul>
+<li><a href="#the-setup">The setup</a></li>
+<li><a href="#step-1-the-spec-is-a-design-decision">Step 1: the spec is a design decision</a></li>
+<li><a href="#step-2-abstract">Step 2: abstract</a></li>
+<li><a href="#step-3-model">Step 3: model</a></li>
+<li><a href="#step-4-run-tlc">Step 4: run TLC</a></li>
+<li><a href="#step-5-check-that-the-model-is-not-lying">Step 5: check that the model is not lying</a></li>
+<li><a href="#step-6-from-bounded-to-any-scale">Step 6: from bounded to any scale</a></li>
+<li><a href="#what-this-does-not-prove">What this does not prove</a></li>
+</ul>
+</li>
+<li><a href="#why-now-ai-writes-the-specs-vstack-keeps-it-honest">Why now: AI writes the specs, vstack keeps it honest</a><ul>
+<li><a href="#does-every-feature-need-its-own-model-do-i-write-the-rules-myself">Does every feature need its own model? Do I write the rules myself?</a></li>
+</ul>
+</li>
+<li><a href="#where-else-it-applies-and-where-it-does-not">Where else it applies, and where it does not</a></li>
+<li><a href="#my-takeaways-what-we-still-need">My takeaways: what we still need</a></li>
+<li><a href="#how-to-start">How to start</a></li>
+<li><a href="#sources">Sources</a></li>
+</ul>
+</div>
+</details></nav><p>The scariest bug in LLM serving is not a crash. It is an HTTP 200 whose answer contains someone else's KV cache.</p>
+<p>This post is my learning notes from Hao AI Lab's <a href="https://haoailab.com/blogs/verifiable-llm-infra/">Towards Verifiable LLM Infra</a> and its two repos, <a href="https://github.com/hao-ai-lab/vstack">vstack</a> and <a href="https://github.com/hao-ai-lab/veriserve">veriserve</a>. It is written for inference engineers with zero formal-methods background. Where something is my own result or opinion rather than theirs, I say so.</p>
+<h2 id="the-bug-that-made-me-care">The bug that made me care<a class="headerlink" href="#the-bug-that-made-me-care" title="Link to this section">#</a></h2>
+<p>In prefill-decode (PD) disaggregation, a Decode instance can time out waiting for a request's KV cache, free that request's KV pages, and hand them to a new request. Meanwhile the Prefill instance's RDMA write for the old request is still queued on the NIC, and it lands in the new request's pages. Nothing crashes and no error is logged. The new user just gets an answer polluted by another user's context.</p>
+<p>This is not hypothetical. The blog cites recent LMSYS and Cloudflare disclosures of PD failures in production, including a rejected-request KV handoff bug that exposed data across 155 user responses.</p>
+<h3 id="how-the-kv-gets-there">How the KV gets there<a class="headerlink" href="#how-the-kv-gets-there" title="Link to this section">#</a></h3>
+<p>Taking SGLang with a push-style transfer backend (Mooncake) as the example, one KV transfer has four steps:</p>
+<figure id="fig-pd-transfer"><svg class='fig' viewBox='0 0 760 458' role='img' aria-label='One KV transfer in PD disaggregation' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='pdt-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='pdt-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='pdt-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='pdt-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='pdt-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='pdt-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>One KV transfer in PD disaggregation (SGLang + Mooncake, push style)</text><rect x='25.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='100' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Router</text><line x1='100' y1='84' x2='100' y2='446' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><rect x='305.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='380' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Prefill</text><line x1='380' y1='84' x2='380' y2='446' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><rect x='585.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='660' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Decode</text><line x1='660' y1='84' x2='660' y2='446' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><path d='M100 118H376' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#pdt-arr-line)'/><path d='M100 140H656' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#pdt-arr-line)'/><text x='112' y='110' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>1  request + bootstrap room</text><rect x='590' y='170' width='140' height='34' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='1.5'/><text x='660' y='192' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>allocate pages</text><path d='M590 228H384' fill='none' stroke='var(--accent2)' stroke-width='1.4' marker-end='url(#pdt-arr-accent2)'/><text x='520.0' y='220' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>2  destination KV page indices</text><rect x='310' y='256' width='140' height='34' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.5'/><text x='380' y='278' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>compute KV</text><path d='M450 300H656' fill='none' stroke='var(--accent)' stroke-width='3' marker-end='url(#pdt-arr-accent)'/><text x='646' y='324' font-size='12.5' text-anchor='end' font-weight='600' fill='var(--accent)'>3  RDMA WRITE into Decode GPU memory</text><text x='646' y='342' font-size='12' text-anchor='end' font-weight='400' fill='var(--muted)' font-style='italic'>one-sided: Decode&#x27;s CPU never sees it</text><path d='M380 380H656' fill='none' stroke='var(--line)' stroke-width='1.4' stroke-dasharray='5 4' marker-end='url(#pdt-arr-line)'/><text x='520.0' y='372' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>4  done notice (after the write completes)</text><rect x='580' y='400' width='160' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='660' y='422' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>pages go to attention</text></svg><figcaption>One KV transfer. Decode chooses the pages; Prefill&#x27;s NIC writes into them directly.</figcaption></figure>
+
+<ol>
+<li>The router assigns the request a bootstrap room (a transfer session id) and sends it to both Prefill and Decode.</li>
+<li>Decode <strong>pre-allocates</strong> KV pages in its own pool and tells Prefill which pages to write (the destination KV indices).</li>
+<li>Prefill computes the KV and posts an <strong>RDMA WRITE</strong>: the NIC writes straight into Decode's GPU memory (GPUDirect RDMA).</li>
+<li>Once the write is done, Prefill sends a done notice. Only then does Decode hand the pages to attention.</li>
+</ol>
+<p>Three properties of one-sided RDMA make this fragile:</p>
+<ul>
+<li><strong>One-sided:</strong> Decode's CPU is not involved and cannot see when the write happens.</li>
+<li><strong>Not cancellable:</strong> in the blog's words, one-sided transfers already queued on the NIC "cannot be canceled in hardware on the studied transport paths".</li>
+<li><strong>Notice-only:</strong> the only way Decode learns the write finished is a message from Prefill.</li>
+</ul>
+<h3 id="how-it-goes-wrong">How it goes wrong<a class="headerlink" href="#how-it-goes-wrong" title="Link to this section">#</a></h3>
+<p>Put a timeout on top and you get the bug:</p>
+<figure id="fig-pd-race"><svg class='fig' viewBox='0 0 760 482' role='img' aria-label='The late RDMA write overwrites a reused page' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='race-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='race-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='race-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='race-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='race-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='race-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>The late write: a timeout is not proof that the remote write stopped</text><rect x='35.0' y='50' width='170' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='120' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Prefill + NIC</text><line x1='120' y1='84' x2='120' y2='470' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><rect x='345.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='420' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Decode</text><line x1='420' y1='84' x2='420' y2='470' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><rect x='585.0' y='50' width='150' height='34' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='660' y='72' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>Request B</text><line x1='660' y1='84' x2='660' y2='470' stroke='var(--line)' stroke-width='1' stroke-dasharray='3 4'/><path d='M420 112H124' fill='none' stroke='var(--accent2)' stroke-width='1.4' marker-end='url(#race-arr-accent2)'/><text x='270.0' y='104' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>write A&#x27;s KV into page P</text><path d='M120 140L416 382' fill='none' stroke='var(--accent)' stroke-width='3' stroke-dasharray='7 5' marker-end='url(#race-arr-accent)'/><text x='128' y='330' font-size='12.5' text-anchor='start' font-weight='600' fill='var(--accent)'>RDMA WRITE queued on the NIC</text><text x='128' y='348' font-size='12' text-anchor='start' font-weight='400' fill='var(--muted)' font-style='italic'>(cannot be cancelled)</text><rect x='434' y='186' width='210' height='50' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.5'/><text x='539' y='206' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>local timeout fires</text><text x='539' y='225' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>abort A, free page P</text><path d='M660 270H424' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#race-arr-line)'/><text x='540.0' y='262' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>new request</text><text x='434' y='300' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>P is allocated to B</text><circle cx='420' cy='384' r='9' fill='var(--bad)'/><text x='438' y='380' font-size='13' text-anchor='start' font-weight='600' fill='var(--bad)'>A&#x27;s KV lands in page P</text><text x='438' y='398' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>and overwrites B&#x27;s KV</text><path d='M420 438H656' fill='none' stroke='var(--bad)' stroke-width='2' marker-end='url(#race-arr-bad)'/><text x='540.0' y='430' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--bad)'>HTTP 200, A&#x27;s context mixed in</text></svg><figcaption>The in-flight write is drawn as a long diagonal: it leaves Prefill before the timeout and lands after page P has a new owner.</figcaption></figure>
+
+<ol>
+<li>Decode allocates page P for request A and tells Prefill to write into P.</li>
+<li>Prefill posts an RDMA WRITE for A targeting P. It waits in the NIC queue.</li>
+<li>The network is congested or Prefill is slow. Decode's local timeout fires.</li>
+<li>Decode decides A has failed: <strong>it aborts A and frees P</strong>.</li>
+<li>Request B arrives. The allocator gives P to B, and B's KV is written into P.</li>
+<li>A's RDMA write finally lands: <strong>A's KV overwrites B's page P</strong>.</li>
+<li>B runs attention over the corrupted KV and returns HTTP 200 with A's context mixed in.</li>
+</ol>
+<p>The root cause is one wrong inference: Decode treated "I have waited too long" as "the other side has stopped writing". With one-sided RDMA, local elapsed time cannot prove that a remote write has stopped.</p>
+<h3 id="why-testing-misses-it">Why testing misses it<a class="headerlink" href="#why-testing-misses-it" title="Link to this section">#</a></h3>
+<p>With n concurrent actors each taking k steps, the number of possible orderings (interleavings) is (nk)!/(k!)^n:</p>
+<table>
+<thead>
+<tr>
+<th>Actors × steps</th>
+<th>Possible orderings</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2 × 5</td>
+<td>252</td>
+</tr>
+<tr>
+<td>3 × 5</td>
+<td>756,756</td>
+</tr>
+<tr>
+<td>4 × 5</td>
+<td>11,732,745,024</td>
+</tr>
+<tr>
+<td>3 × 10</td>
+<td>5,550,996,791,340</td>
+</tr>
+</tbody>
+</table>
+<p>A PD deployment has at least the scheduler, the Prefill worker, the Decode worker, the RDMA NIC, GPU streams, and users who can abort at any moment. A stress test walks one of these orderings, usually the most common one. Reproducing the bug on real hardware also needs multiple GPUs, RDMA NICs and precise cross-node timing.</p>
+<h2 id="formal-verification-in-one-page">Formal verification in one page<a class="headerlink" href="#formal-verification-in-one-page" title="Link to this section">#</a></h2>
+<p>Formal verification means treating the program as a mathematical object, writing "correct" as a precise proposition, and proving it. The whole field fits in one line: <strong>M ⊨ P</strong>, "model M satisfies property P". Testing checks examples; verification checks a universal claim: for all inputs and <strong>all schedules</strong>, the program satisfies P.</p>
+<h3 id="the-model-is-a-state-machine">The model is a state machine<a class="headerlink" href="#the-model-is-a-state-machine" title="Link to this section">#</a></h3>
+<p>A state is a snapshot of the variables that matter. An action has a precondition (when it may happen) and an effect (how the state changes):</p>
+<figure id="fig-state-machine"><svg class='fig' viewBox='0 0 760 200' role='img' aria-label='Alloc moves the allocator from one state to the next' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='sm-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='sm-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='sm-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='sm-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='sm-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='sm-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>A state is a snapshot; an action moves one snapshot to the next</text><text x='24' y='66' font-size='13' text-anchor='start' font-weight='600' fill='var(--muted)'>state s0</text><rect x='24' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='1.25'/><text x='56.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 0</text><text x='56.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>A</text><rect x='98' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='1.25'/><text x='130.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 1</text><text x='130.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>B</text><rect x='172' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='204.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 2</text><text x='204.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>free</text><rect x='246' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='278.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 3</text><text x='278.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>free</text><text x='24' y='160' font-size='13' text-anchor='start' font-weight='400' fill='var(--fg)'>free = {2, 3}</text><text x='24' y='180' font-size='13' text-anchor='start' font-weight='400' fill='var(--fg)'>owner = {0: A, 1: B}</text><path d='M330 104H418' fill='none' stroke='var(--accent)' stroke-width='2' marker-end='url(#sm-arr-accent)'/><text x='374' y='94' font-size='13' text-anchor='middle' font-weight='600' fill='var(--accent)'>Alloc(C, 2)</text><text x='374' y='128' font-size='11.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>needs 2 ∈ free</text><text x='430' y='66' font-size='13' text-anchor='start' font-weight='600' fill='var(--muted)'>state s1</text><rect x='430' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='1.25'/><text x='462.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 0</text><text x='462.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>A</text><rect x='504' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='1.25'/><text x='536.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 1</text><text x='536.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>B</text><rect x='578' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='2'/><text x='610.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 2</text><text x='610.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>C</text><rect x='652' y='76' width='64' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='684.0' y='100' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--fg)'>page 3</text><text x='684.0' y='120' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>free</text><text x='430' y='160' font-size='13' text-anchor='start' font-weight='400' fill='var(--fg)'>free = {3}</text><text x='430' y='180' font-size='13' text-anchor='start' font-weight='400' fill='var(--fg)'>owner = {0: A, 1: B, 2: C}</text></svg><figcaption>Two variables describe the whole allocator. Alloc(C, 2) is enabled because page 2 is free.</figcaption></figure>
+
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">Alloc</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">p</span><span class="p">):</span>
+    <span class="n">require</span><span class="p">(</span><span class="n">p</span> <span class="ow">in</span> <span class="n">free</span><span class="p">)</span>   <span class="c1"># precondition</span>
+    <span class="n">free</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>       <span class="c1"># effect</span>
+    <span class="n">owner</span><span class="p">[</span><span class="n">p</span><span class="p">]</span> <span class="o">=</span> <span class="n">r</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">Free</span><span class="p">(</span><span class="n">p</span><span class="p">):</span>
+    <span class="n">require</span><span class="p">(</span><span class="n">p</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">free</span><span class="p">)</span>
+    <span class="n">owner</span><span class="p">[</span><span class="n">p</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">free</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+</code></pre></div>
+
+<p>One run of the system is a sequence of states s0 → s1 → s2 …, called a behavior or trace.</p>
+<h3 id="nondeterminism-is-the-key-trick">Nondeterminism is the key trick<a class="headerlink" href="#nondeterminism-is-the-key-trick" title="Link to this section">#</a></h3>
+<p>At every step, any action whose precondition holds may be the next one. You do not simulate the network, the thread scheduler or the NIC. You only say "the RDMA completion OR the timeout OR a new request may happen next", and the checker tries every branch. Everything you cannot control becomes a choice, and the property must hold on every branch.</p>
+<figure id="fig-nondeterminism"><svg class='fig' viewBox='0 0 760 344' role='img' aria-label='Nondeterminism: every enabled action is a branch' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='nd-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='nd-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='nd-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='nd-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='nd-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='nd-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>A test walks one path; a model checker walks every branch</text><rect x='24' y='150' width='220' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='134.0' y='174' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>state s</text><text x='134.0' y='194' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>A&#x27;s RDMA write in flight</text><path d='M244 178C290 178 300 92 330 92' fill='none' stroke='var(--accent2)' stroke-width='2.4' marker-end='url(#nd-arr-accent2)'/><rect x='332' y='70' width='210' height='44' rx='8' fill='var(--card)' stroke='var(--accent2)' stroke-width='2'/><text x='437.0' y='97.0' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>RDMA completes first</text><path d='M542 92L612 66.4' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><path d='M542 92L612 92.0' fill='none' stroke='var(--accent2)' stroke-width='2.4' marker-end='url(#nd-arr-accent2)'/><path d='M542 92L612 117.6' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><text x='622' y='97' font-size='16' text-anchor='start' font-weight='400' fill='var(--muted)'>…</text><path d='M244 178C290 178 300 172 330 172' fill='none' stroke='var(--line)' stroke-width='1.3' marker-end='url(#nd-arr-line)'/><rect x='332' y='150' width='210' height='44' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='437.0' y='177.0' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>timeout fires first</text><path d='M542 172L612 146.4' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><path d='M542 172L612 172.0' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><path d='M542 172L612 197.6' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><text x='622' y='177' font-size='16' text-anchor='start' font-weight='400' fill='var(--muted)'>…</text><path d='M244 178C290 178 300 252 330 252' fill='none' stroke='var(--line)' stroke-width='1.3' marker-end='url(#nd-arr-line)'/><rect x='332' y='230' width='210' height='44' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='437.0' y='257.0' font-size='13' text-anchor='middle' font-weight='600' fill='var(--fg)'>new request arrives</text><path d='M542 252L612 226.4' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><path d='M542 252L612 252.0' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><path d='M542 252L612 277.6' fill='none' stroke='var(--line)' stroke-width='1.1' marker-end='url(#nd-arr-line)'/><text x='622' y='257' font-size='16' text-anchor='start' font-weight='400' fill='var(--muted)'>…</text><line x1='560' y1='300' x2='600' y2='300' stroke='var(--accent2)' stroke-width='2.4'/><text x='608' y='304' font-size='12.5' text-anchor='start' font-weight='600' fill='var(--accent2)'>one test run</text><line x1='560' y1='322' x2='600' y2='322' stroke='var(--line)' stroke-width='1.3'/><text x='608' y='326' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>explored by TLC</text></svg><figcaption>Each enabled action is a branch. A test follows one; TLC enumerates them all.</figcaption></figure>
+
+<h3 id="safety-and-liveness">Safety and liveness<a class="headerlink" href="#safety-and-liveness" title="Link to this section">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Safety</th>
+<th>Liveness</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Meaning</td>
+<td>A bad thing never happens</td>
+<td>A good thing eventually happens</td>
+</tr>
+<tr>
+<td>Inference examples</td>
+<td>A KV page is never owned by two requests; a locked radix node is never evicted</td>
+<td>Every request finishes; a draining page is eventually reclaimed</td>
+</tr>
+<tr>
+<td>Counterexample</td>
+<td>A finite trace that reaches the bad state</td>
+<td>An infinite loop: deadlock, livelock, starvation</td>
+</tr>
+</tbody>
+</table>
+<p>Liveness usually needs fairness assumptions ("if the RDMA completion keeps being possible, it eventually happens"), and those assumptions are promises about your hardware.</p>
+<h3 id="proofs-rest-on-inductive-invariants">Proofs rest on inductive invariants<a class="headerlink" href="#proofs-rest-on-inductive-invariants" title="Link to this section">#</a></h3>
+<p>To prove Inv holds in every reachable state you need two facts: <strong>Init ⇒ Inv</strong>, and <strong>Inv ∧ Next ⇒ Inv′</strong> (any step from a state satisfying Inv keeps it). It is the same idea as a loop invariant.</p>
+<p>The catch: the property you care about is rarely inductive on its own. "A node with lock_ref &gt; 0 is never evicted" fails the induction step, because it allows states where lock_ref no longer matches the real number of users. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.</p>
+<h3 id="three-families-of-tools-used-together">Three families of tools, used together<a class="headerlink" href="#three-families-of-tools-used-together" title="Link to this section">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Model checking</th>
+<th>SMT solving</th>
+<th>Theorem proving</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tools</td>
+<td>TLC, Apalache</td>
+<td>Z3, cvc5</td>
+<td>TLAPS, Lean, Coq, Dafny, Verus</td>
+</tr>
+<tr>
+<td>How</td>
+<td>Enumerate every reachable state</td>
+<td>Encode the question as a formula: "is there a solution?"</td>
+<td>Write a proof, usually by induction</td>
+</tr>
+<tr>
+<td>Automation</td>
+<td>Full</td>
+<td>Mostly</td>
+<td>Needs a human or an AI</td>
+</tr>
+<tr>
+<td>Any scale</td>
+<td>No, bounded</td>
+<td>Bounded, or within a theory</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Finding bugs</td>
+<td>Excellent: shortest counterexample trace</td>
+<td>Good: concrete counterexample values</td>
+<td>Weak</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>Protocols, concurrency, lifecycles</td>
+<td>Arithmetic, indexing, addresses</td>
+<td>Final, unbounded guarantees</td>
+</tr>
+</tbody>
+</table>
+<p>Model checking does breadth-first search, so the first violation it finds is the <strong>shortest</strong> reproduction. It suffers from state explosion, so you run it at tiny scale (say 3 requests and 2 pages). That works because of the small-scope hypothesis: most concurrency bugs show up at small scale. In my own toy model of the RDMA bug above, 2 requests and 1 page are enough to hit it.</p>
+<p>SMT turns a bug into a question. Can two different (page, slot) pairs map to the same KV address? (<a href="/assets/models/kv_address.py">kv_address.py</a>)</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">z3</span><span class="w"> </span><span class="kn">import</span> <span class="o">*</span>
+<span class="n">p1</span><span class="p">,</span> <span class="n">t1</span><span class="p">,</span> <span class="n">p2</span><span class="p">,</span> <span class="n">t2</span> <span class="o">=</span> <span class="n">Ints</span><span class="p">(</span><span class="s2">"p1 t1 p2 t2"</span><span class="p">)</span>
+<span class="n">PAGE</span><span class="p">,</span> <span class="n">NPAGES</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">1024</span>
+<span class="n">s</span> <span class="o">=</span> <span class="n">Solver</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="p">[(</span><span class="n">p1</span><span class="p">,</span> <span class="n">t1</span><span class="p">),</span> <span class="p">(</span><span class="n">p2</span><span class="p">,</span> <span class="n">t2</span><span class="p">)]:</span>
+    <span class="n">s</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">p</span><span class="p">,</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">NPAGES</span><span class="p">,</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">t</span><span class="p">,</span> <span class="n">t</span> <span class="o">&lt;</span> <span class="n">PAGE</span><span class="p">)</span>
+<span class="n">s</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">Or</span><span class="p">(</span><span class="n">p1</span> <span class="o">!=</span> <span class="n">p2</span><span class="p">,</span> <span class="n">t1</span> <span class="o">!=</span> <span class="n">t2</span><span class="p">))</span>         <span class="c1"># two different (page, slot) pairs</span>
+<span class="n">s</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">p1</span><span class="o">*</span><span class="n">PAGE</span> <span class="o">+</span> <span class="n">t1</span> <span class="o">==</span> <span class="n">p2</span><span class="o">*</span><span class="n">PAGE</span> <span class="o">+</span> <span class="n">t2</span><span class="p">)</span>   <span class="c1"># ...same address?</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">check</span><span class="p">())</span>  <span class="c1"># unsat: impossible, proven for every value</span>
+</code></pre></div>
+
+<p>Change <code>t &lt; PAGE</code> to <code>t &lt;= PAGE</code> (a classic off-by-one) and Z3 answers <code>sat</code> with a concrete collision: page 0 slot 16 and page 1 slot 0.</p>
+<h3 id="reading-verified-correctly">Reading "verified" correctly<a class="headerlink" href="#reading-verified-correctly" title="Link to this section">#</a></h3>
+<p>Every result really means: <strong>under assumptions A, model M satisfies property P.</strong> A can be wrong (the NIC does drop completion notices). M can be wrong (a code path left out, or a non-atomic step modeled as atomic). P can be wrong (you proved something other than what you care about). "Verified" does not mean bug-free. It means any remaining bug lives outside an explicit list of assumptions and abstractions.</p>
+<h2 id="the-pd-bug-is-a-dilemma-not-a-bad-timeout-value">The PD bug is a dilemma, not a bad timeout value<a class="headerlink" href="#the-pd-bug-is-a-dilemma-not-a-bad-timeout-value" title="Link to this section">#</a></h2>
+<p>With safety and liveness in hand, the PD bug looks different. Decode has two options when a transfer is late, and each breaks one property:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Keeps</th>
+<th>Breaks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Free the pages on timeout</td>
+<td>Liveness: requests never hang, pages are always reclaimed</td>
+<td>Isolation (safety): a late write lands in a new request's pages</td>
+</tr>
+<tr>
+<td>Wait for the done notice</td>
+<td>Isolation: pages are never reused while a write may land</td>
+<td>Finality (liveness): a lost notice hangs the request and its pages forever</td>
+</tr>
+</tbody>
+</table>
+<p>The blog proves this is not a tuning problem: under unbounded asynchronous delay, where local histories are indistinguishable, no local-only page reclamation policy can guarantee both. veriserve's way out is to separate what happens to the <strong>request</strong> from what happens to its <strong>pages</strong>:</p>
+<figure id="fig-pd-fix"><svg class='fig' viewBox='0 0 760 278' role='img' aria-label='PdLedger page states after a release or timeout' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='fix-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='fix-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='fix-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='fix-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='fix-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='fix-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>A page is reused only after proof that the write stopped</text><path d='M194 170H266' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#fix-arr-line)'/><path d='M440 162H480V110H532' fill='none' stroke='var(--good)' stroke-width='1.4' marker-end='url(#fix-arr-good)'/><path d='M440 178H480V230H532' fill='none' stroke='var(--bad)' stroke-width='1.4' marker-end='url(#fix-arr-bad)'/><rect x='24' y='142' width='170' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='109.0' y='166' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>PRIVATE</text><text x='109.0' y='186' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>in use by one request</text><rect x='270' y='142' width='170' height='56' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='355.0' y='166' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>DRAINING</text><text x='355.0' y='186' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>waits for stop evidence</text><text x='355' y='222' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)' font-style='italic'>its request has already failed</text><rect x='536' y='82' width='200' height='56' rx='8' fill='var(--card)' stroke='var(--good)' stroke-width='1.8'/><text x='636.0' y='106' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>FREE</text><text x='636.0' y='126' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>ACK: the write has stopped</text><rect x='536' y='202' width='200' height='56' rx='8' fill='var(--card)' stroke='var(--bad)' stroke-width='1.8'/><text x='636.0' y='226' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>QUARANTINED</text><text x='636.0' y='246' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>no proof: never reused</text><text x='230' y='162' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>release</text><text x='506' y='102' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>ACK</text><text x='506' y='248' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>no ACK</text></svg><figcaption>PdLedger page states on a release or timeout (simplified; the full ledger also has SHARED and DUP states for prefix sharing).</figcaption></figure>
+
+<p>On a timeout the request fails and returns at once, so it never hangs. Its pages go to DRAINING, not FREE, and Decode sends an ABORT asking Prefill whether the write has stopped.</p>
+<ul>
+<li><strong>Prefill acknowledges only what it can prove:</strong> the write was never handed to the NIC (it is cancelled, and a tombstone makes any later post of it fail), or the write has completed. With that ACK, the pages go back to FREE.</li>
+<li><strong>No proof means quarantine:</strong> if the ACK times out, Prefill reports a failed write it cannot vouch for, or the peer is lost, the pages go to QUARANTINED and are never reused for the life of the process. A late write can then only land in a page nobody uses.</li>
+<li><strong>Generations reject stale messages:</strong> every page carries a (page, gen) ticket and transfer ids are never reused. A done notice or ACK that does not match the peer, room, generation and transfer id is dropped. This closes a second bug family, where a message from an old session is taken for the current one.</li>
+<li><strong>Prefill reports done only when it is true:</strong> the done notice goes out after every block has completed locally, not when the write is posted, because a notice sent at submission can overtake the data.</li>
+</ul>
+<p>The cost is a few pages lost for good when something goes wrong. Across six paired runs against an unverified bypass baseline, the blog measures PdLedger at +0.18% mean p50 TPOT (95% CI −0.32% to +0.68%). Note what is proven: the TLAPS proof covers safety only. Finality, the request failing fast instead of hanging, is runtime behavior outside the proof.</p>
+<p>Upstream, veriserve's case studies split the SGLang issues in two. Room-reuse identity confusion has five local fix PRs, all open and unmerged when the case studies were checked on 2026-11-08 (they apply the generation idea above). Treating a timeout or an error as "the remote side has stopped" is filed as architectural, with no local PR, because no local patch escapes the dilemma; it needs a page state machine like this one.</p>
+<h2 id="a-worked-example-an-80-line-model-of-a-real-vllm-bug">A worked example: an 80-line model of a real vLLM bug<a class="headerlink" href="#a-worked-example-an-80-line-model-of-a-real-vllm-bug" title="Link to this section">#</a></h2>
+<p>To learn the workflow end to end, I modeled one bug from vstack's list: after a LoRA hot reload, new requests can silently run on old weights (<a href="https://github.com/vllm-project/vllm/pull/67459">vLLM PR #67459</a>). The model is my own teaching version, written from that PR's code change; the vstack and veriserve repos do not publish one. Every TLC result quoted here is a real run. Files: <a href="/assets/models/LoraReload.tla">LoraReload.tla</a>, <a href="/assets/models/bug.cfg">bug.cfg</a>, <a href="/assets/models/fix.cfg">fix.cfg</a>, <a href="/assets/models/reach.cfg">reach.cfg</a>.</p>
+<h3 id="the-setup">The setup<a class="headerlink" href="#the-setup" title="Link to this section">#</a></h3>
+<figure id="fig-lora-ledgers"><svg class='fig' viewBox='0 0 760 276' role='img' aria-label='vLLM keeps LoRA state in two ledgers' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='lora-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='lora-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='lora-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='lora-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='lora-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='lora-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>Two ledgers, plus a copy in every queued request</text><rect x='24' y='56' width='210' height='92' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='129.0' y='80' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>front-end ledger</text><text x='129.0' y='100' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>serving.py</text><text x='129.0' y='118' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>name → LoRARequest</text><text x='129.0' y='136' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>(id, path)</text><rect x='284' y='56' width='190' height='92' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='379.0' y='80' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>queued request r</text><text x='379.0' y='100' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>carries the LoRARequest</text><text x='379.0' y='118' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>current at admission</text><rect x='524' y='56' width='212' height='92' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='630.0' y='80' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>worker ledger</text><text x='630.0' y='100' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>worker_manager.py</text><text x='630.0' y='118' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>CPU LRU cache: id → weights</text><text x='630.0' y='136' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>capacity max_cpu_loras</text><path d='M234 102H280' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#lora-arr-line)'/><path d='M474 102H520' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#lora-arr-line)'/><text x='257' y='172' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>at admission</text><text x='497' y='172' font-size='12' text-anchor='middle' font-weight='400' fill='var(--muted)'>add_adapter()</text><rect x='24' y='196' width='712' height='64' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25' stroke-dasharray='5 4'/><text x='40' y='222' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>hot reload (load_inplace=True): the worker reloads from the new path and the front end points at it,</text><text x='40' y='242' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--muted)'>but requests already queued still carry the old path; a cache miss loads whatever path the request carries.</text></svg><figcaption>The front end, the queued request and the worker can each hold a different idea of which weights adapter A means.</figcaption></figure>
+
+<p>vLLM keeps LoRA state in two ledgers. The front end maps each adapter name to a <code>LoRARequest</code> (an int id plus a weight path), and every incoming request carries the <code>LoRARequest</code> that was current when it was admitted. Each worker keeps a CPU LRU cache from id to loaded weights. <code>add_adapter</code> loads from the request's own path on a cache miss, and reuses the cached weights on a hit without looking at the path. A hot reload (<code>/load_lora_adapter</code> with <code>load_inplace=True</code>) reloads the worker and points the front end at the new path.</p>
+<p>The bug, in five events:</p>
+<ol>
+<li>Adapter A is at v1. Request r1 arrives carrying "A → v1" and waits in the queue.</li>
+<li>A is hot-reloaded to v2. The worker cache and the front end both now say v2.</li>
+<li>A request for adapter B runs. The CPU cache is full, so A is evicted.</li>
+<li>r1 is scheduled. A is not cached, so it is loaded from r1's stale path: <strong>the cache goes back to v1</strong>.</li>
+<li>New request r2 carries "A → v2", finds A in the cache, and <strong>runs on v1 weights with no error</strong>.</li>
+</ol>
+<p>The victim (r2) is not the culprit (r1), which is why per-request assertions miss it. The bug also needs more adapters than <code>max_cpu_loras</code>; single-adapter setups are unaffected.</p>
+<h3 id="step-1-the-spec-is-a-design-decision">Step 1: the spec is a design decision<a class="headerlink" href="#step-1-the-spec-is-a-design-decision" title="Link to this section">#</a></h3>
+<p>The obvious spec, "every request runs the version it was admitted with", is wrong: the upstream fix runs r1 on v2 too, which is what a hot reload should mean. The policy I chose is that old requests may run on newer weights, but new requests must never run on older ones:</p>
+<div class="highlight"><pre><span></span><code>NoStaleWeights == \A r \in Reqs : status[r] = "done" =&gt; used[r] &gt;= snap[r]
+</code></pre></div>
+
+<h3 id="step-2-abstract">Step 2: abstract<a class="headerlink" href="#step-2-abstract" title="Link to this section">#</a></h3>
+<p>Paths become version numbers. The cache gets capacity 1 with only adapters A and B, which is enough to evict A. All of B's traffic collapses into one action, <code>UseB</code>. Tensors, GPU slots and tensor parallelism are dropped. One simplification is recorded as an assumption: the hot reload is modeled as a single atomic step. The model has 7 variables and 4 actions (<code>Admit</code>, <code>Reload</code>, <code>UseB</code>, <code>Run</code>), each mapped back to a code location.</p>
+<h3 id="step-3-model">Step 3: model<a class="headerlink" href="#step-3-model" title="Link to this section">#</a></h3>
+<p>The key action is a direct translation of <code>add_adapter</code>. A constant <code>FIX</code> lets one model describe the code before and after the patch:</p>
+<div class="highlight"><pre><span></span><code>Run(r) ==
+  /\ status[r] = "queued"
+  /\ LET loadVer == IF FIX /\ inplaceSrc # 0
+                     THEN inplaceSrc   \* fixed: newest hot-reload source
+                     ELSE snap[r]      \* original: the request's stale path
+         ver == IF cacheA = 0 THEN loadVer   \* miss: load
+                              ELSE cacheA    \* hit: reuse
+     IN /\ cacheA' = ver
+        /\ cacheB' = IF cacheA = 0 THEN FALSE ELSE cacheB
+        /\ used' = [used EXCEPT ![r] = ver]
+  /\ status' = [status EXCEPT ![r] = "done"]
+  /\ UNCHANGED &lt;&lt;reg, inplaceSrc, snap&gt;&gt;
+</code></pre></div>
+
+<h3 id="step-4-run-tlc">Step 4: run TLC<a class="headerlink" href="#step-4-run-tlc" title="Link to this section">#</a></h3>
+<div class="highlight"><pre><span></span><code>java<span class="w"> </span>-cp<span class="w"> </span>tla2tools.jar<span class="w"> </span>tlc2.TLC<span class="w"> </span>-deadlock<span class="w"> </span>-config<span class="w"> </span>bug.cfg<span class="w"> </span>LoraReload
+</code></pre></div>
+
+<p>With 2 requests and 2 versions, TLC finds the violation in under a second and prints the five-event story above as a 7-state trace, the shortest one possible:</p>
+<figure id="fig-lora-trace"><svg class='fig' viewBox='0 0 760 326' role='img' aria-label='TLC counterexample for the LoRA hot-reload bug' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='trace-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='trace-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='trace-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='trace-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='trace-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='trace-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>TLC&#x27;s counterexample: the worker cache falls behind the front end at step 5</text><line x1='100' y1='90' x2='716' y2='90' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='94' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>v2</text><line x1='100' y1='170' x2='716' y2='170' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='174' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>v1</text><line x1='100' y1='230' x2='716' y2='230' stroke='var(--line)' stroke-opacity='0.35'/><text x='90' y='234' font-size='12.5' text-anchor='end' font-weight='400' fill='var(--muted)'>not cached</text><polyline points='120,166 216,166 312,86 408,86 504,86 600,86 696,86' fill='none' stroke='var(--accent2)' stroke-width='2.4'/><polyline points='120,174 216,174 312,94 408,234 504,174 600,174 696,174' fill='none' stroke='var(--accent)' stroke-width='2.4' stroke-dasharray='6 4'/><circle cx='120' cy='174' r='4' fill='var(--accent)'/><circle cx='216' cy='174' r='4' fill='var(--accent)'/><circle cx='312' cy='94' r='4' fill='var(--accent)'/><circle cx='408' cy='234' r='4' fill='var(--accent)'/><circle cx='504' cy='174' r='4' fill='var(--accent)'/><circle cx='600' cy='174' r='4' fill='var(--accent)'/><circle cx='696' cy='174' r='4' fill='var(--accent)'/><text x='120' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>1</text><text x='120' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>init</text><text x='216' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>2</text><text x='216' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Admit r1</text><text x='312' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>3</text><text x='312' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Reload</text><text x='408' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>4</text><text x='408' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>UseB</text><text x='504' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>5</text><text x='504' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Run r1</text><text x='600' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>6</text><text x='600' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Admit r2</text><text x='696' y='262' font-size='12' text-anchor='middle' font-weight='600' fill='var(--muted)'>7</text><text x='696' y='280' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--fg)'>Run r2</text><circle cx='696' cy='174' r='9' fill='none' stroke='var(--bad)' stroke-width='2'/><text x='504' y='154' font-size='12.5' text-anchor='middle' font-weight='600' fill='var(--accent)'>cache regresses to v1</text><text x='712' y='202' font-size='12.5' text-anchor='end' font-weight='600' fill='var(--bad)'>r2 carries v2, runs v1</text><line x1='120' y1='306' x2='150' y2='306' stroke='var(--accent2)' stroke-width='2.4'/><text x='158' y='310' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>registered version (front end)</text><line x1='420' y1='306' x2='450' y2='306' stroke='var(--accent)' stroke-width='2.4' stroke-dasharray='6 4'/><text x='458' y='310' font-size='12.5' text-anchor='start' font-weight='400' fill='var(--fg)'>adapter A in the worker cache</text></svg><figcaption>TLC&#x27;s 7-state counterexample, plotted. The cache (orange) falls below the registered version (blue) at step 5; step 7 violates NoStaleWeights.</figcaption></figure>
+
+<p>Then the fix: the worker remembers the latest in-place source for each adapter id and loads from it on a miss.</p>
+<table>
+<thead>
+<tr>
+<th>Config</th>
+<th>Distinct states</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Original code, 2 requests, 2 versions</td>
+<td>89</td>
+<td>NoStaleWeights violated, 7-state trace</td>
+</tr>
+<tr>
+<td>Fixed code, 2 requests, 2 versions</td>
+<td>90</td>
+<td>Passes</td>
+</tr>
+<tr>
+<td>Fixed code, 3 requests, 3 versions</td>
+<td>2,486</td>
+<td>Passes</td>
+</tr>
+</tbody>
+</table>
+<p>A beginner trap: the first run of the fixed model reported "Deadlock reached". Once every request is done the model has nothing left to do, which TLC treats as deadlock by default. Here that is normal termination, so run with <code>-deadlock</code>.</p>
+<h3 id="step-5-check-that-the-model-is-not-lying">Step 5: check that the model is not lying<a class="headerlink" href="#step-5-check-that-the-model-is-not-lying" title="Link to this section">#</a></h3>
+<p>A property passes either because it is true, or because the bad state is unreachable in your model. Three checks separate the two:</p>
+<ul>
+<li><strong>The historical bug must fail</strong> on the original model. It does.</li>
+<li><strong>Mutation:</strong> delete the line in <code>Reload</code> that records the new source. The fixed model fails again, so that line is load-bearing.</li>
+<li><strong>Reachability witness:</strong> assert something that <em>should</em> be violated ("no request admitted after a reload ever finishes"). TLC breaks it at the 4th state, so the interesting path is reachable.</li>
+</ul>
+<h3 id="step-6-from-bounded-to-any-scale">Step 6: from bounded to any scale<a class="headerlink" href="#step-6-from-bounded-to-any-scale" title="Link to this section">#</a></h3>
+<p>The fact that carries the proof is a strengthened invariant:</p>
+<div class="highlight"><pre><span></span><code>FreshCache ==
+  /\ cacheA \in {0, reg}              \* cached A is absent or newest
+  /\ (reg &gt; 1 =&gt; inplaceSrc = reg)    \* a reload always records its source
+  /\ \A r \in Reqs : snap[r] &lt;= reg   \* no request holds a future version
+</code></pre></div>
+
+<p>TLC confirms it on the fixed model at 3 requests and 3 versions; on the original model it fails right after the first reload. Its first line states the bug in one sentence: the worker cache must never be older than the front end. Proving it inductive with TLAPS would extend the result to any number of requests and versions.</p>
+<h3 id="what-this-does-not-prove">What this does not prove<a class="headerlink" href="#what-this-does-not-prove" title="Link to this section">#</a></h3>
+<p>The atomic hot reload hides a real window between the worker reload and the front-end update. The model has one worker, while tensor parallelism gives each worker its own cache. vstack's bug list also notes that the fix does not cover a cache-key mismatch after rolling back to an earlier path. Splitting <code>Reload</code> into two actions is a good exercise.</p>
+<h2 id="why-now-ai-writes-the-specs-vstack-keeps-it-honest">Why now: AI writes the specs, vstack keeps it honest<a class="headerlink" href="#why-now-ai-writes-the-specs-vstack-keeps-it-honest" title="Link to this section">#</a></h2>
+<p>Formal methods are decades old. What changed is cost. Hand-written specs and proofs took months, while vLLM and SGLang merge new code every day. LLMs can now read a large codebase and produce specs and proofs quickly. Proof checkers are strict, so a fake proof is rejected: the failure mode is "could not prove it", not "hallucinated a proof".</p>
+<p>The new failure mode is <strong>reward hacking</strong>. In the blog's words, when a checker finds a race, a naive coding agent "weakens the invariant, deletes the timeout branch from the model" instead of surfacing the real bug, until the checker says 0 errors.</p>
+<p><a href="https://github.com/hao-ai-lab/vstack">vstack</a> is a plugin for Claude Code, Codex and Cursor built to block this. It adds no new solver; it uses TLC, Apalache, TLAPS and Z3. It forces the agent through gates:</p>
+<table>
+<thead>
+<tr>
+<th>Gate</th>
+<th>What it enforces</th>
+<th>Where it showed up in the LoRA example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Role isolation</td>
+<td>Coordinator, worker and red-team agents are kept separate</td>
+<td>I reviewed the spec and the results myself</td>
+</tr>
+<tr>
+<td>Hash-pinned specs</td>
+<td>SHA-256 locks the approved safety properties, so they cannot be quietly weakened</td>
+<td>NoStaleWeights never changed after step 1</td>
+</tr>
+<tr>
+<td>Line-anchored models</td>
+<td>Every state variable and action maps to <code>file:line@commit</code></td>
+<td>The variable-to-code mapping in step 2</td>
+</tr>
+<tr>
+<td>Mutation and trace gates</td>
+<td>The old bug must fail, the fix must pass, removing a guard must fail again, real traces must replay</td>
+<td>Step 5 (without trace replay)</td>
+</tr>
+<tr>
+<td>Proof and runtime checks</td>
+<td>TLAPS proofs for critical state machines, with preconditions mirrored as runtime checks</td>
+<td>FreshCache in step 6</td>
+</tr>
+</tbody>
+</table>
+<p>The blog summarizes the workflow as five steps (specification, abstraction, validation, verification, continuous checking). The repo splits it into nine stage skills:</p>
+<figure id="fig-vstack-stages"><svg class='fig' viewBox='0 0 760 384' role='img' aria-label='vstack&#x27;s nine stages' xmlns='http://www.w3.org/2000/svg' font-family='var(--sans)'><defs><marker id='vs-arr-line' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--line)'/></marker><marker id='vs-arr-accent' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent)'/></marker><marker id='vs-arr-accent2' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--accent2)'/></marker><marker id='vs-arr-bad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--bad)'/></marker><marker id='vs-arr-good' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--good)'/></marker><marker id='vs-arr-muted' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0 0L10 5L0 10z' fill='var(--muted)'/></marker></defs><text x='24' y='30' font-size='15' text-anchor='start' font-weight='600' fill='var(--fg)'>vstack&#x27;s nine stages (orange: the ones the LoRA example walked through)</text><rect x='24' y='52' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='132.0' y='76' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S0  decompose</text><text x='132.0' y='96' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>control, data, boundaries;</text><text x='132.0' y='114' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>historical bug anchors</text><rect x='272' y='52' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='380.0' y='76' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S1  select</text><text x='380.0' y='96' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>tool and assurance</text><text x='380.0' y='114' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>tier per property</text><rect x='520' y='52' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='628.0' y='76' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S2  spec</text><text x='628.0' y='96' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>owner approves;</text><text x='628.0' y='114' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>hash-pinned</text><rect x='520' y='168' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='628.0' y='192' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S3  model</text><text x='628.0' y='212' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>from pinned code,</text><text x='628.0' y='230' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>file:line@commit</text><rect x='272' y='168' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='380.0' y='192' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S4  calibrate + traces</text><text x='380.0' y='212' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>bug fails, fix passes,</text><text x='380.0' y='230' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>real traces replay</text><rect x='24' y='168' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='132.0' y='192' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S5  red team</text><text x='132.0' y='212' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>attack fidelity, strength,</text><text x='132.0' y='230' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>scope extrapolation</text><rect x='24' y='284' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='132.0' y='308' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S6  hunt + fix</text><text x='132.0' y='328' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>counterexamples, fixes</text><text x='132.0' y='346' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>in model and code</text><rect x='272' y='284' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--accent)' stroke-width='1.8'/><text x='380.0' y='308' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S7  prove</text><text x='380.0' y='328' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>inductive invariants,</text><text x='380.0' y='346' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>TLAPS</text><rect x='520' y='284' width='216' height='80' rx='8' fill='var(--card)' stroke='var(--line)' stroke-width='1.25'/><text x='628.0' y='308' font-size='14' text-anchor='middle' font-weight='600' fill='var(--fg)'>S8  package + maintain</text><text x='628.0' y='328' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>regression skill that</text><text x='628.0' y='346' font-size='12.5' text-anchor='middle' font-weight='400' fill='var(--muted)'>reruns as code changes</text><path d='M240 92.0H268' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M488 92.0H516' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M628.0 132V164' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M520 208.0H492' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M272 208.0H244' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M132.0 248V280' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M240 324.0H268' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/><path d='M488 324.0H516' fill='none' stroke='var(--line)' stroke-width='1.4' marker-end='url(#vs-arr-line)'/></svg><figcaption>vstack&#x27;s stage skills, S0 to S8.</figcaption></figure>
+
+<p>Using it looks like this:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># install from the command line</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/hao-ai-lab/vstack.git
+<span class="nb">cd</span><span class="w"> </span>vstack<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>uv<span class="w"> </span>tool<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+vstack<span class="w"> </span>setup<span class="w">    </span><span class="c1"># checks Java/TLC/Z3, installs skills into Claude Code, Codex or Cursor</span>
+
+<span class="c1"># or as a plugin: in Claude Code</span>
+/plugin<span class="w"> </span>marketplace<span class="w"> </span>add<span class="w"> </span>hao-ai-lab/vstack
+/plugin<span class="w"> </span>install<span class="w"> </span>vstack
+<span class="c1"># in Cursor</span>
+/add-plugin<span class="w"> </span>vstack
+
+<span class="c1"># then: one module plus one safety property</span>
+/vstack-mode<span class="w"> </span>verify<span class="w"> </span>that<span class="w"> </span>our<span class="w"> </span>RDMA<span class="w"> </span>KV<span class="w"> </span>cache<span class="w"> </span>lease<span class="w"> </span>manager<span class="w"> </span>never<span class="w"> </span>recycles<span class="w"> </span>an<span class="w"> </span>in-flight<span class="w"> </span>page<span class="w"> </span>on<span class="w"> </span>timeout.
+</code></pre></div>
+
+<p>Even with vstack, three steps stay with a human: approving the spec, judging whether a counterexample is real and reproducing it on hardware, and reviewing the assumption list at the end.</p>
+<h3 id="does-every-feature-need-its-own-model-do-i-write-the-rules-myself">Does every feature need its own model? Do I write the rules myself?<a class="headerlink" href="#does-every-feature-need-its-own-model-do-i-write-the-rules-myself" title="Link to this section">#</a></h3>
+<p>Both yes. Nobody models a whole engine. Pick a subsystem with a clear boundary and keep only the state the property needs. But draw the boundary where components interact, not along the directory tree: veriserve's ledger covers RDMA transfer, prefix sharing and decode attention in one state machine, because the PD bugs live at their seams.</p>
+<p>Defining the rules is the step least safe to hand to an AI. You do not start from zero, though. Most bugs in vstack's list fall into five classes (the list also uses Progress and Invariance for a few):</p>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Meaning</th>
+<th>Example</th>
+<th>Ask of a new feature</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Isolation</td>
+<td>Data never crosses requests</td>
+<td>A KV page is never written by another request</td>
+<td>Can it leak data?</td>
+</tr>
+<tr>
+<td>Integrity</td>
+<td>No stale or corrupt state</td>
+<td>New requests never use old LoRA weights</td>
+<td>Can it use stale state?</td>
+</tr>
+<tr>
+<td>Finality</td>
+<td>Requests terminate</td>
+<td>An abort always takes effect</td>
+<td>Can it hang?</td>
+</tr>
+<tr>
+<td>Conservation</td>
+<td>No leaked resources</td>
+<td>Every page is accounted for</td>
+<td>Can it leak resources?</td>
+</tr>
+<tr>
+<td>Agreement</td>
+<td>All ranks agree</td>
+<td>Every DP rank enters the same collective</td>
+<td>Can ranks diverge?</td>
+</tr>
+</tbody>
+</table>
+<h2 id="where-else-it-applies-and-where-it-does-not">Where else it applies, and where it does not<a class="headerlink" href="#where-else-it-applies-and-where-it-does-not" title="Link to this section">#</a></h2>
+<p>Follow a request through an inference engine and almost every stop has a property worth checking:</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Property</th>
+<th>Tool</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request lifecycle</td>
+<td>An abort at any point frees every resource, and the request terminates</td>
+<td>TLA+</td>
+</tr>
+<tr>
+<td>Scheduler admission and retraction</td>
+<td>Memory stays within budget; chunked prefill covers the prompt exactly once</td>
+<td>TLA+, Z3</td>
+</tr>
+<tr>
+<td>KV allocator</td>
+<td>Used + free = total; no double free</td>
+<td>TLA+</td>
+</tr>
+<tr>
+<td>Prefix cache</td>
+<td>A node with lock_ref &gt; 0 is never evicted; counts match the tree</td>
+<td>TLA+</td>
+</tr>
+<tr>
+<td>Speculative decoding</td>
+<td>Rejected tokens' KV is rolled back; the sampling distribution equals the target model's</td>
+<td>TLA+, Lean</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>The token mask equals exactly the set the grammar allows</td>
+<td>Automata, SMT</td>
+</tr>
+<tr>
+<td>Streaming detokenization</td>
+<td>Incremental chunks concatenate to the one-shot decode, UTF-8 boundaries included</td>
+<td>Property tests</td>
+</tr>
+<tr>
+<td>CUDA graph padding</td>
+<td>Writes from padding rows never touch real requests' KV</td>
+<td>Z3</td>
+</tr>
+<tr>
+<td>Parallel collectives</td>
+<td>All ranks issue collectives in the same order; all-to-all is a permutation</td>
+<td>TLA+, Z3</td>
+</tr>
+<tr>
+<td>Kernel indexing</td>
+<td>Block tables and mask bounds never go out of range</td>
+<td>Z3</td>
+</tr>
+</tbody>
+</table>
+<p>These are not hypothetical. From vstack's verified bug list:</p>
+<ul>
+<li><strong>SGLang, PD:</strong> a reopened bootstrap room reset the in-flight RDMA counter, causing an early abort ACK and cross-request KV overwrite (68/68 reproductions on GB200).</li>
+<li><strong>SGLang, multi-rank scheduler:</strong> with DP attention and the prefill delayer, DP ranks decided locally whether to defer prefill and entered different collectives; the server aborted.</li>
+<li><strong>SGLang, DP attention abort path:</strong> an abort and its request reach the owning rank over two unordered channels; an abort that arrived first was dropped, and 19 of 200 requests ran on.</li>
+<li><strong>SGLang, CUDA graph padding:</strong> padded rows wrote into reserved slot 0 and produced NaN logits.</li>
+<li><strong>vLLM, multimodal KV keys:</strong> with prefix caching and the multimodal processor cache disabled, media items got per-process counter ids instead of content hashes, so an external KV store shared across processes answered a blue image with an earlier red image's content.</li>
+</ul>
+<p>It is a poor fit for some things. Performance (latency, throughput) is out of scope. Floating point is hard: addition is not associative, so "bit-identical to the reference kernel" is often false by design, and proving error bounds is expensive. Anything without a precise definition, such as output quality, cannot be specified. And Python plus CUDA cannot be verified directly today, so the realistic setup is a design-level model plus runtime checks and trace replay to keep it honest.</p>
+<p>My rule of thumb: if you can state in one precise sentence what must never happen or what must eventually happen, and tests cannot cover every ordering, it is worth a model.</p>
+<h2 id="my-takeaways-what-we-still-need">My takeaways: what we still need<a class="headerlink" href="#my-takeaways-what-we-still-need" title="Link to this section">#</a></h2>
+<p>Formal verification can largely handle the bugs testing is worst at: interleavings, lifecycles, resource accounting and index arithmetic. What I think is still missing:</p>
+<ol>
+<li><strong>Specs are the product, and humans must own them.</strong> The tool proves whatever you write down. Deciding what "correct" means was the hardest and least automatable step in my example. Inference engines would benefit from a shared, reviewed spec library organized by the classes above, reused across vLLM and SGLang.</li>
+<li><strong>The model-code gap needs CI, not a one-off proof.</strong> We cannot verify Python or CUDA directly, so the model is a second artifact that drifts. Trace replay (production logs must be valid behaviors of the model) and runtime checks derived from the model's preconditions should run on every PR, like tests.</li>
+<li><strong>Hardware assumptions are the new trust boundary.</strong> Half of the PD story is RDMA semantics: what a one-sided write guarantees, whether it can be cancelled, what a completion actually certifies. Proofs are only as good as that assumption list, and much of it is tribal knowledge today, not a spec anyone stands behind.</li>
+</ol>
+<h2 id="how-to-start">How to start<a class="headerlink" href="#how-to-start" title="Link to this section">#</a></h2>
+<p>You do not need to go all the way at once:</p>
+<ol>
+<li>Turn the <code>assert</code>s you already have into precise invariants (used + free pages = total; lock_ref = real users).</li>
+<li>Hammer them with property-based tests: generate random sequences of alloc, free, abort and evict with Hypothesis.</li>
+<li>Put the same invariant into TLA+ and let TLC try every interleaving at small scale.</li>
+<li>Validate the model: the old bug fails, mutations fail, a reachability witness is violated, real traces replay.</li>
+<li>Where you need a full guarantee, find the strengthened invariant and prove it with TLAPS or Dafny.</li>
+</ol>
+<p>Good first resources are Leslie Lamport's free TLA+ video course, <a href="https://learntla.com">learntla.com</a>, and the <a href="https://microsoft.github.io/z3guide">Z3 guide</a>.</p>
+<h2 id="sources">Sources<a class="headerlink" href="#sources" title="Link to this section">#</a></h2>
+<ul>
+<li>Hao AI Lab, <a href="https://haoailab.com/blogs/verifiable-llm-infra/">Towards Verifiable LLM Infra</a></li>
+<li><a href="https://github.com/hao-ai-lab/vstack">vstack</a>: the agent workflow and the verified bug list (<a href="https://github.com/hao-ai-lab/vstack/blob/main/bugs/verified-bugs.csv">bugs/verified-bugs.csv</a>)</li>
+<li><a href="https://github.com/hao-ai-lab/veriserve">veriserve</a>: PdLedger, its TLA+/TLAPS/Z3 models and the <a href="https://github.com/hao-ai-lab/veriserve/tree/main/verification/pd-disagg/case-studies">PD case studies</a></li>
+<li><a href="https://github.com/vllm-project/vllm/pull/67459">vLLM PR #67459</a>: the LoRA hot-reload fix</li>
+<li>My model and config files: <a href="/assets/models/LoraReload.tla">LoraReload.tla</a>, <a href="/assets/models/bug.cfg">bug.cfg</a>, <a href="/assets/models/fix.cfg">fix.cfg</a>, <a href="/assets/models/reach.cfg">reach.cfg</a>, <a href="/assets/models/kv_address.py">kv_address.py</a></li>
+</ul></article>
+</main>
+<footer class="site"><p>© 2026 Wenlong · <a href="https://github.com/wwl2755">GitHub</a></p></footer>
+</body>
+</html>

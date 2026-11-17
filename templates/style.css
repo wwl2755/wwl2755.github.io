@@ -1,0 +1,83 @@
+:root {
+  --bg: #fbfaf7;
+  --fg: #1b1f27;
+  --muted: #586172;
+  --line: #8a93a3;
+  --rule: #e4e0d6;
+  --card: #ffffff;
+  --code-bg: #f3f1ec;
+  --accent: #b5561c;
+  --accent2: #2a65a8;
+  --good: #2e7d32;
+  --bad: #c62828;
+  --link: #2a65a8;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181e;
+    --fg: #e7e4dd;
+    --muted: #a5adbb;
+    --line: #77808f;
+    --rule: #2c313b;
+    --card: #1d2129;
+    --code-bg: #1f232b;
+    --accent: #f0a05a;
+    --accent2: #86b7e8;
+    --good: #7cc47f;
+    --bad: #f2827d;
+    --link: #8fbdec;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.7 var(--sans); }
+a { color: var(--link); text-underline-offset: 2px; }
+header.site, main, footer.site { max-width: 760px; margin: 0 auto; padding: 0 20px; }
+header.site { display: flex; justify-content: space-between; align-items: baseline; padding-top: 28px; padding-bottom: 8px; }
+header.site .brand { font-weight: 700; color: var(--fg); text-decoration: none; }
+header.site nav a { margin-left: 18px; color: var(--muted); text-decoration: none; font-size: 15px; }
+footer.site { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule); margin-top: 64px; padding-top: 16px; padding-bottom: 40px; }
+footer.site a { color: var(--muted); }
+
+.intro h1 { font-size: 34px; margin: 40px 0 4px; }
+.intro p { color: var(--muted); margin: 0 0 32px; }
+ul.posts { list-style: none; padding: 0; }
+ul.posts li { padding: 18px 0; border-top: 1px solid var(--rule); }
+ul.posts time { display: block; color: var(--muted); font-size: 14px; }
+ul.posts a { font-size: 21px; font-weight: 650; text-decoration: none; color: var(--fg); }
+ul.posts a:hover { color: var(--link); }
+ul.posts p { margin: 4px 0 0; color: var(--muted); }
+
+.post header h1 { font-size: 36px; line-height: 1.2; margin: 6px 0 24px; letter-spacing: -0.01em; }
+.post .meta { color: var(--muted); margin: 32px 0 0; font-size: 15px; }
+.post h2 { font-size: 26px; line-height: 1.3; margin: 56px 0 12px; padding-top: 8px; border-top: 1px solid var(--rule); }
+.post h3 { font-size: 20px; margin: 36px 0 8px; }
+.post h2 .headerlink, .post h3 .headerlink { margin-left: 8px; color: var(--line); text-decoration: none; font-weight: 400; opacity: 0; }
+.post h2:hover .headerlink, .post h3:hover .headerlink { opacity: 1; }
+.post p, .post li { overflow-wrap: break-word; }
+.post code { font-family: var(--mono); font-size: 0.86em; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+.post .highlight { background: var(--code-bg) !important; border-radius: 8px; overflow-x: auto; margin: 20px 0; }
+.post .highlight pre { margin: 0; padding: 14px 18px; font: 14px/1.55 var(--mono); }
+.post .highlight code { background: none; padding: 0; font-size: inherit; }
+.post pre:not(.highlight pre) { background: var(--code-bg); border-radius: 8px; padding: 14px 18px; overflow-x: auto; font: 14px/1.55 var(--mono); }
+
+.post table { border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 15px; display: block; overflow-x: auto; }
+.post th, .post td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--rule); }
+.post th { font-weight: 650; border-bottom: 2px solid var(--line); }
+
+.post figure { margin: 28px 0; }
+.post figure svg.fig { width: 100%; height: auto; display: block; background: var(--card); border: 1px solid var(--rule); border-radius: 10px; }
+.post figcaption { color: var(--muted); font-size: 14px; margin-top: 8px; }
+
+.toc details { border: 1px solid var(--rule); border-radius: 8px; padding: 8px 16px; margin-bottom: 24px; background: var(--card); }
+.toc summary { cursor: pointer; font-weight: 600; }
+.toc ul { margin: 8px 0; padding-left: 20px; font-size: 15px; }
+.toc a { text-decoration: none; }
+
+@media (max-width: 600px) {
+  body { font-size: 16px; }
+  .post header h1 { font-size: 28px; }
+  .post h2 { font-size: 22px; }
+}
