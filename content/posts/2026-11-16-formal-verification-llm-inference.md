@@ -263,15 +263,15 @@ These are not hypothetical. From vstack's verified bug list ([SGLang](https://gi
 
 It is a poor fit for some things. Performance (latency, throughput) is out of scope. Floating point is hard: addition is not associative, so "bit-identical to the reference kernel" is often false by design, and proving error bounds is expensive. Anything without a precise definition, such as output quality, cannot be specified. And Python plus CUDA cannot be verified directly today, so the realistic setup is a design-level model plus runtime checks and trace replay to keep it honest.
 
-**My rule of thumb: if you can state in one precise sentence what must never happen or what must eventually happen, and tests cannot cover every ordering, it is worth a model.**
+**My rule of thumb: if you can state in one sentence what must never (or must eventually) happen, tests can't reach the orderings that break it, and a violation would be silent or costly, it is worth a model.**
 
 ## My takeaways: what we still need
 
-Formal verification can largely handle the bugs testing is worst at: interleavings, lifecycles, resource accounting and index arithmetic. What I think is still missing:
+At the design level, formal verification can largely handle the bugs testing is worst at: interleavings, lifecycles, resource accounting and index arithmetic. What I think is still missing:
 
-1. **Specs are the product, and humans must own them.** The tool proves whatever you write down. Deciding what "correct" means was the hardest and least automatable step in my example. Inference engines would benefit from a shared, reviewed spec library organized by the classes above, reused across vLLM and SGLang.
+1. **Specs are the product, and humans must own them.** The tool proves whatever you write down. Deciding what "correct" means was the hardest and least automatable step in my example. Inference engines would benefit from a shared, reviewed spec library organized by the classes above.
 2. **The model-code gap needs CI, not a one-off proof.** We cannot verify Python or CUDA directly, so the model is a second artifact that drifts. Trace replay (production logs must be valid behaviors of the model) and runtime checks derived from the model's preconditions should run on every PR, like tests.
-3. **Hardware assumptions are the new trust boundary.** Half of the PD story is RDMA semantics: what a one-sided write guarantees, whether it can be cancelled, what a completion actually certifies. Proofs are only as good as that assumption list, and much of it is tribal knowledge today, not a spec anyone stands behind.
+3. **Hardware assumptions are the new trust boundary.** Half of the PD story is RDMA semantics: what a one-sided write guarantees, whether it can be cancelled, what a completion actually certifies. Proofs are only as good as that assumption list, and much of it lives in provider-specific behavior rather than a spec you can model against.
 
 ## Sources
 
