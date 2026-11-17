@@ -150,7 +150,7 @@ With safety and liveness in hand, the PD bug looks different. Decode has two opt
 
 The blog proves this is not a tuning problem: under unbounded asynchronous delay, where local histories are indistinguishable, no local-only page reclamation policy can guarantee both. veriserve's way out is to separate what happens to the **request** from what happens to its **pages**:
 
-{{fig:pd-fix|PdLedger page states on a release or timeout (simplified; the full ledger also has SHARED and DUP states for prefix sharing).}}
+{{fig:pd-fix|PdLedger page states on a release or timeout. Simplified: the ledger tracks six states in all, adding SHARED and DUP for prefix sharing.}}
 
 On a timeout the request fails and returns at once, so it never hangs. Its pages go to DRAINING, not FREE, and Decode sends an ABORT asking Prefill whether the write has stopped.
 
