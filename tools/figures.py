@@ -332,7 +332,7 @@ def induction():
     n = "ind"
     b = [t(24, 30, "Why a property must be strengthened before it can be proved by induction", 15, weight=600)]
     b.append("<ellipse cx='260' cy='185' rx='232' ry='118' fill='none' stroke='var(--line)' stroke-width='1.5'/>")
-    b.append(t(40, 58, "P: nodes with lock_ref > 0 are never evicted", 13, weight=600))
+    b.append(t(40, 58, "P: a node a running request uses is never evicted", 13, weight=600))
     b.append("<ellipse cx='220' cy='190' rx='150' ry='72' fill='var(--accent2)' fill-opacity='0.08' stroke='var(--accent2)' stroke-width='2'/>")
     b.append(t(220, 146, "Inv = P + accurate lock_ref", 12.5, "middle", 600, "var(--accent2)"))
     pts = [(110, 195), (170, 172), (240, 208), (300, 182)]
@@ -348,10 +348,10 @@ def induction():
     b.append(path(n, f"M{ux + 6} {uy + 6}L{ux + 100} {uy + 80}", "bad", 1.8))
     b.append(f"<circle cx='{ux + 104}' cy='{uy + 83}' r='6' fill='none' stroke='var(--bad)' stroke-width='1.6'/>")
     b.append(t(520, 96, "u: unreachable, but inside P:", 12.5, weight=600, color="var(--bad)"))
-    b.append(t(520, 114, "lock_ref = 1, two requests", 12.5, color="var(--muted)"))
-    b.append(t(520, 132, "use the node. One finishes,", 12.5, color="var(--muted)"))
-    b.append(t(520, 150, "lock_ref drops to 0, and the", 12.5, color="var(--muted)"))
-    b.append(t(520, 168, "node is evicted while in use.", 12.5, color="var(--muted)"))
+    b.append(t(520, 114, "lock_ref = 0 while a running", 12.5, color="var(--muted)"))
+    b.append(t(520, 132, "request still uses the node.", 12.5, color="var(--muted)"))
+    b.append(t(520, 150, "One eviction step is legal and", 12.5, color="var(--muted)"))
+    b.append(t(520, 168, "evicts a node in use: P breaks.", 12.5, color="var(--muted)"))
     return svg(n, 760, 316, "A non-inductive property versus a strengthened inductive invariant", "".join(b))
 
 

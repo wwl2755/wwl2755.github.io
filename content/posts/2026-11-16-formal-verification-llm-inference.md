@@ -103,7 +103,7 @@ Liveness usually needs fairness assumptions ("if the RDMA completion keeps being
 
 To prove a property Inv holds in every reachable state you need two facts: **Init ⇒ Inv** (every start state satisfies Inv) and **Inv ∧ Next ⇒ Inv′** (if Inv holds and any one enabled action runs, Inv still holds afterwards). Here ⇒ means "implies", ∧ means "and", Init describes the start states, Next means "any one enabled action", and the prime in Inv′ means "evaluated on the state after the step". It is the same idea as a loop invariant: true on entry, preserved by every iteration.
 
-The catch: the property you care about is rarely inductive on its own. Take P = "a prefix-cache node with lock_ref > 0 is never evicted". P also holds in an odd state that the real system never reaches: lock_ref = 1 while two running requests use the node. From there, one request finishes and unlocks, lock_ref drops to 0, eviction becomes legal, and a node that is still in use gets evicted. So "P before the step" does not guarantee "P after the step", and the induction fails. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.
+The catch: the property you care about is rarely inductive on its own. Take P = "a prefix-cache node that a running request still uses is never evicted", where the eviction code only evicts nodes with lock_ref = 0. P also holds in an odd state that the real system never reaches: lock_ref = 0 while a running request still uses the node (the count is too low). From that state a single eviction step is legal and evicts a node in use. So "P before the step" does not guarantee "P after the step", and the induction fails. You must strengthen it, for example by adding "lock_ref equals the number of running requests whose path crosses the node". Finding that strengthening is writing down why the system is correct. veriserve's proof of its PD page ledger needed 54 inductive invariants across 64 protocol actions.
 
 {{fig:induction|P alone admits unreachable states like u from which one step breaks P. The strengthened Inv excludes them, so every step from Inv stays in Inv.}}
 
@@ -190,7 +190,7 @@ The victim (r2) is not the culprit (r1), which is why per-request assertions mis
 
 ### Reading the TLA+ below
 
-TLA+ describes the same kind of state machine as the Python sketch earlier. The model's state is seven variables:
+TLA+ describes the same kind of state machine as the Python sketch earlier. `Reqs` is the set of requests in the model (r1, r2, …). The model's state is seven variables:
 
 | Variable | Meaning |
 | --- | --- |
@@ -288,7 +288,7 @@ A beginner trap: the first run of the fixed model reported "Deadlock reached". O
 A property passes either because it is true, or because the bad state is unreachable in your model. Three checks separate the two:
 
 - **The historical bug must fail** on the original model. It does.
-- **Mutation:** delete the `inplaceSrc'` line from `Reload` (the line that records the new source). The fixed model fails again, so that line is load-bearing.
+- **Mutation:** in the fixed model, change `Reload`'s `inplaceSrc'` line to `inplaceSrc' = inplaceSrc`, so the new source is never recorded. The fixed model fails again, so that line is load-bearing.
 - **Reachability witness:** assert something that *should* be violated ("no request admitted after a reload ever finishes"). TLC breaks it at the 4th state, so the interesting path is reachable.
 
 ### Step 6: from bounded to any scale
@@ -297,12 +297,12 @@ The fact that carries the proof is a strengthened invariant:
 
 ```tla
 FreshCache ==
-  /\ cacheA \in {0, reg}              \* cached A is absent or newest
+  /\ cacheA \in {0, reg}              \* cacheA is 0 or reg: absent or newest
   /\ (reg > 1 => inplaceSrc = reg)    \* a reload always records its source
   /\ \A r \in Reqs : snap[r] <= reg   \* no request holds a future version
 ```
 
-This is the strengthening from the induction section. The first line is the real point and states the bug in one sentence: the worker cache must never be older than the front end. The other two lines are what make it inductive: line 2 says the source a cache miss would load from is always the newest, and line 3 rules out impossible states where a request holds a version from the future. On the original model the second line fails right after the first reload, because the old code never records a source; the first line fails at state 5.
+This is the strengthening from the induction section. The first line is the real point and states the bug in one sentence: the worker cache must never be older than the front end. The other two lines are what make it inductive: line 2 says the source a cache miss would load from is always the newest, and line 3 rules out impossible states where a request holds a version from the future. On the original model TLC reports the second line failing right after the first reload, because the old code never records a source; the first line would fail later too, at state 5 of the trace above.
 
 TLC confirms FreshCache holds in every reachable state of the fixed model with 3 requests and 3 versions. That alone is not a proof that it is inductive. Proving that with TLAPS would extend the result to any number of requests and versions.
 
